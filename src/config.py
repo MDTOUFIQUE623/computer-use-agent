@@ -1,6 +1,6 @@
 import pyautogui
 
-MODEL="gemini-3.5-flash"
+MODEL="gemini-2.0-flash"
 
 MAX_STEPS=15
 
