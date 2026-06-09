@@ -1,8 +1,8 @@
 import time
 import pyautogui
 
-from brain import Action
-from config import WAIT_SECONDS
+from src.brain import Action
+from src.config import WAIT_SECONDS
 
 def execute_action(action: Action) -> str:
     """Execute one Action on the real screen and return a short log string."""

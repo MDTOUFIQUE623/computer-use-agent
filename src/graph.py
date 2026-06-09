@@ -8,8 +8,8 @@ from PIL import Image
 
 from actions import execute_action
 from brain import Action, decide_action
-from config import MAX_STEPS
-from screen import capture_screen
+from src.config import MAX_STEPS
+from src.screen import capture_screen
 
 # Load environment variables (useful if running components independently)
 load_dotenv()
@@ -106,4 +106,4 @@ workflow.add_conditional_edges(
 )
 
 # Compile the graph
-app = workflow.compile()
+app = workflow.compile()

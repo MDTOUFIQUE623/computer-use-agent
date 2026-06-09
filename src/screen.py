@@ -1,7 +1,7 @@
 import pyautogui
 from PIL import Image
 
-from config import SCREENSHOT_WIDTH
+from src.config import SCREENSHOT_WIDTH
 
 def capture_screen() -> Image.Image:
     """Capture the full primary screen and downscale it for the vision model."""

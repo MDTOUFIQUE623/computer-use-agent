@@ -5,7 +5,7 @@ from google.genai import types
 from PIL import Image
 from pydantic import BaseModel
 
-from config import MODEL
+from src.config import MODEL
 
 class Action(BaseModel):
     """One step the agent wants to take. Coordinates are normalized 0-1000."""
