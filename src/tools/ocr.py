@@ -175,12 +175,11 @@ class OCRTools:
             # Also search in pairs for multi-word targets
             found = _find_in_words(words, target)
 
+            # CORRECT — dict access everywhere
             if found is None:
                 return ToolResult(
                     success=False,
-                    message=(
-                        f"Text '{target_text}' not found in '{app_name}'"
-                    ),
+                    message=f"Text '{target_text}' not found in '{app_name}'",
                     error="TextNotFound",
                     data={
                         "searched_text": target_text,
@@ -193,18 +192,18 @@ class OCRTools:
                 success=True,
                 message=(
                     f"Found '{target_text}' in '{app_name}' "
-                    f"at ({found.center_x}, {found.center_y})"
+                    f"at ({found['center_x']}, {found['center_y']})"
                 ),
                 data={
-                    "word":       found.text,
-                    "center_x":  found.center_x,
-                    "center_y":  found.center_y,
-                    "confidence": found.confidence,
+                    "word":       found["text"],
+                    "center_x":  found["center_x"],
+                    "center_y":  found["center_y"],
+                    "confidence": found["confidence"],
                     "region": {
-                        "left":   found.left,
-                        "top":    found.top,
-                        "width":  found.width,
-                        "height": found.height,
+                        "left":   found["left"],
+                        "top":    found["top"],
+                        "width":  found["width"],
+                        "height": found["height"],
                     },
                 },
                 duration_ms=_ms(start)
@@ -273,8 +272,11 @@ class OCRTools:
         try:
             image  = _screenshot_full()
             words  = _run_ocr(image, offset_x=0, offset_y=0)
-            target = target_text.lower()
-            found  = _find_in_words(words, target)
+
+            # Convert to dicts — same format as find_text_in_window uses
+            word_dicts = [_word_to_dict(w) for w in words]
+            target     = target_text.lower()
+            found      = _find_in_words(word_dicts, target)
 
             if found is None:
                 return ToolResult(
@@ -288,18 +290,18 @@ class OCRTools:
                 success=True,
                 message=(
                     f"Found '{target_text}' at "
-                    f"({found.center_x}, {found.center_y})"
+                    f"({found['center_x']}, {found['center_y']})"
                 ),
                 data={
-                    "word":       found.text,
-                    "center_x":  found.center_x,
-                    "center_y":  found.center_y,
-                    "confidence": found.confidence,
+                    "word":       found["text"],
+                    "center_x":  found["center_x"],
+                    "center_y":  found["center_y"],
+                    "confidence": found["confidence"],
                     "region": {
-                        "left":   found.left,
-                        "top":    found.top,
-                        "width":  found.width,
-                        "height": found.height,
+                        "left":   found["left"],
+                        "top":    found["top"],
+                        "width":  found["width"],
+                        "height": found["height"],
                     },
                 },
                 duration_ms=_ms(start)
@@ -542,8 +544,10 @@ def _run_ocr(
     n = len(data["text"])
 
     # Calculate scale factor if image was downscaled
-    orig_width  = pyautogui.size().width
-    scale = orig_width / OCR_SCREENSHOT_WIDTH if image.width <= OCR_SCREENSHOT_WIDTH else 1.0
+    # orig_width  = pyautogui.size().width
+    # scale = orig_width / OCR_SCREENSHOT_WIDTH if image.width <= OCR_SCREENSHOT_WIDTH else 1.0
+    scale=1.0
+
 
     for i in range(n):
         text = str(data["text"][i]).strip()
@@ -619,46 +623,31 @@ def _words_to_text(words: list[WordData]) -> str:
 def _find_in_words(
     words: list[dict],
     target: str,
-) -> Optional[WordData]:
+) -> Optional[dict]:
     """
-    Find target text in a list of word dicts (from OCR result data).
+    Find target text in a list of word dicts.
+    All callers must pass dicts — never WordData objects directly.
     Supports both single words and multi-word phrases.
-    Returns the WordData of the best match or None.
-
-    For multi-word targets, returns the WordData of the first word
-    in the match (so clicking it gets close to the text).
+    Returns the dict of the best match or None.
     """
-    target_lower  = target.lower()
-    target_words  = target_lower.split()
+    target_lower = target.lower()
+    target_parts = target_lower.split()
 
-    # Rebuild WordData objects from dicts
-    word_objects: list[WordData] = []
-    for w in words:
-        word_objects.append(WordData(
-            text       = w["text"],
-            confidence = w["confidence"],
-            left       = w["left"],
-            top        = w["top"],
-            width      = w["width"],
-            height     = w["height"],
-            center_x   = w["center_x"],
-            center_y   = w["center_y"],
-        ))
-
-    # Single word search
-    if len(target_words) == 1:
+    # Single word search — find highest confidence match
+    if len(target_parts) == 1:
         best      = None
         best_conf = -1.0
-        for w in word_objects:
-            if target_lower in w.text.lower() and w.confidence > best_conf:
-                best      = w
-                best_conf = w.confidence
+        for w in words:
+            if target_lower in w["text"].lower():
+                if w["confidence"] > best_conf:
+                    best      = w
+                    best_conf = w["confidence"]
         return best
 
     # Multi-word search — look for consecutive words matching the phrase
-    for i in range(len(word_objects) - len(target_words) + 1):
-        chunk = word_objects[i : i + len(target_words)]
-        chunk_text = " ".join(w.text.lower() for w in chunk)
+    for i in range(len(words) - len(target_parts) + 1):
+        chunk      = words[i : i + len(target_parts)]
+        chunk_text = " ".join(w["text"].lower() for w in chunk)
         if target_lower in chunk_text:
             return chunk[0]  # Return first word of the match
 
