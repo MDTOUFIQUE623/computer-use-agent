@@ -3,4 +3,4 @@ from .windows_ui import WindowsUITools
 from .browser import BrowserTools
 from .ocr import OCRTools
 from .vision import VisionTools
-# from .apps import AppTools
+from .apps import AppTools
