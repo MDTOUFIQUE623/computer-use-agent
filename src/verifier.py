@@ -5,8 +5,8 @@ from typing import Optional
 
 import psutil
 
-from config import VERIFICATION_TIMEOUT, ELEMENT_TIMEOUT
-from models import (
+from src.config import VERIFICATION_TIMEOUT, ELEMENT_TIMEOUT
+from src.models import (
     Step,
     ToolResult,
     ToolType,
@@ -110,6 +110,15 @@ def _route_verification(
     # --- wait / screenshot / system — trust the tool ---
     if action in (ActionType.WAIT, ActionType.SCREENSHOT, ActionType.VOLUME_SET):
         return VerificationStatus.SUCCESS, "Action type does not require verification"
+
+    # After the existing action checks, add:
+    if action in (
+        ActionType.SPOTIFY_PLAY,
+        ActionType.SPOTIFY_PAUSE,
+        ActionType.SPOTIFY_NEXT,
+        ActionType.SPOTIFY_PLAYLIST,
+    ):
+        return VerificationStatus.SUCCESS, "Spotify action completed"
 
     # --- fallback: uncertain but not failed ---
     log.debug(

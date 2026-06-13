@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 import time
@@ -69,8 +70,23 @@ ROUTING RULES:
   - Electron apps (WhatsApp, Spotify UI) → use ocr as primary,
     vision as fallback
   - Unknown UI elements → try windows_ui first, then ocr, then vision
-""".strip()
 
+EXAMPLES OF CORRECT PLANS:
+  "play music on Spotify":
+    step 1: windows_ui / open_app / target="Spotify"
+    step 2: apps / spotify_play / target="Spotify"
+
+  "search for X online":
+    step 1: browser / search_web / target="X"
+    step 2: browser / extract_text / target="body"
+
+  "create folder X on Desktop":
+    step 1: files / create_folder / target="<full Desktop path>" / value="X"
+
+  "move PDFs from Downloads to Documents":
+    step 1: files / find_files / target="<Downloads path>" / value="*.pdf"
+    step 2: files / move_file / target="<Downloads path>" / value="<Documents path>"
+""".strip()
 
 # ---------------------------------------------------------------------------
 # System prompt for the planner
@@ -100,6 +116,26 @@ Rules:
 
 Respond ONLY with valid JSON matching the Plan schema.
 No markdown, no explanation outside the JSON.
+
+IMPORTANT:
+
+- Return ONLY one valid JSON object.
+- Do NOT wrap it in ```json fences.
+- Do NOT include explanations.
+- Do NOT include notes before or after the JSON.
+- The first character of the response must be {
+- The last character of the response must be }
+
+CRITICAL: Only use these exact action values:
+open_app, close_app, focus_app, click, type_text, press_key, scroll, select,
+navigate, search_web, click_element, fill_form, extract_text, wait_for_page,
+move_file, copy_file, rename_file, delete_file, create_folder, list_files,
+find_files, organize_files, spotify_play, spotify_pause, spotify_next,
+spotify_playlist, notion_create_page, notion_append, clipboard_copy,
+clipboard_paste, volume_set, wait, screenshot
+
+Never invent action names. Never use: respond, display, show, open_url, type.
+target must always be a non-empty string. Never set target to null.
 """.strip()
 
 
@@ -117,7 +153,7 @@ Return a JSON object with this exact structure:
   "steps": [
     {
       "step_number": 1,
-      "tool": "windows_ui|browser|files|apps|ocr|vision|system",
+      "tool": "windows_ui|browser|files|apps|ocr|vision",
       "action": "open_app|navigate|move_file|...",
       "target": "what to act on — app name, url, file path, element name",
       "value": "text to type, volume level, etc (or null)",
@@ -229,7 +265,10 @@ class Brain:
         attempt: which replan attempt this is (1 or 2)
         """
         if attempt > MAX_REPLAN_ATTEMPTS:
-            log.warning("Max replan attempts reached for step %d", original_step.step_number)
+            log.warning(
+                "Max replan attempts reached for step %d",
+                original_step.step_number,
+            )
             return None
 
         log.info(
@@ -240,36 +279,36 @@ class Brain:
         )
 
         prompt = f"""
-A step in an automation task has failed. Suggest ONE alternative step.
+    A step in an automation task has failed. Suggest ONE alternative step.
 
-Original step:
-  Tool:    {original_step.tool.value}
-  Action:  {original_step.action.value}
-  Target:  {original_step.target}
-  Value:   {original_step.value}
+    Original step:
+    Tool:    {original_step.tool.value}
+    Action:  {original_step.action.value}
+    Target:  {original_step.target}
+    Value:   {original_step.value}
 
-Failure reason: {failure_reason}
+    Failure reason: {failure_reason}
 
-{TOOL_CATALOGUE}
+    {TOOL_CATALOGUE}
 
-Return ONLY a JSON object for the replacement step:
-{{
-  "step_number": {original_step.step_number},
-  "tool": "different_tool_than_{original_step.tool.value}",
-  "action": "action_name",
-  "target": "what to act on",
-  "value": null,
-  "description": "what this alternative step does",
-  "expected_outcome": "what should be true if this succeeds",
-  "fallback_tool": null,
-  "requires_verification": true
-}}
+    Return ONLY a JSON object for the replacement step:
+    {{
+    "step_number": {original_step.step_number},
+    "tool": "different_tool_than_{original_step.tool.value}",
+    "action": "action_name",
+    "target": "what to act on",
+    "value": null,
+    "description": "what this alternative step does",
+    "expected_outcome": "what should be true if this succeeds",
+    "fallback_tool": null,
+    "requires_verification": true
+    }}
 
-Rules:
-- Do NOT suggest the same tool that just failed
-- Use the simplest alternative approach
-- If no alternative exists, return {{"impossible": true}}
-""".strip()
+    Rules:
+    - Do NOT suggest the same tool that just failed
+    - Use the simplest alternative approach
+    - If no alternative exists, return {{"impossible": true}}
+    """.strip()
 
         try:
             response = self._client.models.generate_content(
@@ -277,7 +316,7 @@ Rules:
                 contents=[prompt],
                 config=types.GenerateContentConfig(
                     max_output_tokens=500,
-                )
+                ),
             )
 
             raw = response.text or ""
@@ -285,11 +324,37 @@ Rules:
 
             data = json.loads(raw)
 
+            # Gemini determined no alternative exists
             if data.get("impossible"):
                 log.info("Replan determined step is impossible")
                 return None
 
+            # Validate required fields before building Step
+            if not data.get("target"):
+                log.warning(
+                    "Replan returned no target for step %d",
+                    original_step.step_number,
+                )
+                return None
+
+            # Normalize value type
+            if data.get("value") is not None:
+                data["value"] = str(data["value"])
+
+            # Convert string values to enums
+            data["tool"] = ToolType(data["tool"])
+            data["action"] = ActionType(data["action"])
+
+            if data.get("fallback_tool"):
+                data["fallback_tool"] = ToolType(data["fallback_tool"])
+            else:
+                data["fallback_tool"] = None
+
             return Step(**data)
+
+        except (json.JSONDecodeError, ValueError) as e:
+            log.error("Invalid replan response: %s", e)
+            return None
 
         except Exception as e:
             log.error("replan_step failed: %s", e)
@@ -332,7 +397,7 @@ Rules:
         Called by graph.py when all steps complete successfully.
         """
         try:
-            from models import TaskPattern
+            from src.models import TaskPattern
             pattern = TaskPattern(
                 task_description = task,
                 tool_sequence    = [s.tool   for s in plan.steps],
@@ -358,7 +423,7 @@ Rules:
         Called by graph.py when a step fails all retries.
         """
         try:
-            from models import FailureRecord
+            from src.models import FailureRecord
             record = FailureRecord(
                 app_name         = app_name,
                 tool_attempted   = step.tool,
@@ -378,26 +443,39 @@ Rules:
     # Private helpers
     # -----------------------------------------------------------------------
 
-    def _build_planning_prompt(
-        self,
-        task:  str,
-        hints: str,
-    ) -> str:
-        """Build the full planning prompt sent to Gemini."""
-        parts = []
+    def _build_planning_prompt(self, task: str, hints: str) -> str:
+        import os
+        home = os.path.expanduser("~")
 
-        # Task
-        parts.append(f"TASK: {task}")
+        # Detect actual desktop path
+        onedrive_desktop = os.path.join(home, "OneDrive", "Desktop")
+        regular_desktop  = os.path.join(home, "Desktop")
+        desktop_path     = (
+            onedrive_desktop
+            if os.path.exists(onedrive_desktop)
+            else regular_desktop
+        )
 
-        # Memory hints (if any)
+        user_context = f"""
+    USER ENVIRONMENT:
+    Home directory: {home}
+    Desktop path:   {desktop_path}
+    Downloads:      {os.path.join(home, "Downloads")}
+    Documents:      {os.path.join(home, "OneDrive", "Documents") if os.path.exists(os.path.join(home, "OneDrive", "Documents")) else os.path.join(home, "Documents")}
+    Username:       {os.path.basename(home)}
+    OS:             Windows 11
+    """.strip()
+
+        parts = [
+            f"TASK: {task}",
+            user_context,
+        ]
+
         if hints:
-            parts.append(f"\n{hints}")
+            parts.append(hints)
 
-        # Tool catalogue
-        parts.append(f"\n{TOOL_CATALOGUE}")
-
-        # Schema
-        parts.append(f"\n{PLAN_SCHEMA}")
+        parts.append(TOOL_CATALOGUE)
+        parts.append(PLAN_SCHEMA)
 
         return "\n\n".join(parts)
 
@@ -434,29 +512,36 @@ Rules:
             return None
 
     def _build_plan(self, data: dict, task: str) -> Optional[Plan]:
-        """
-        Build and validate a Plan from a parsed dict.
-        Handles missing fields gracefully.
-        """
         try:
-            # Validate and coerce steps
             steps = []
             for i, step_data in enumerate(data.get("steps", [])):
                 try:
+                    # Skip steps with None or missing target
+                    if not step_data.get("target"):
+                        log.warning(
+                            "Skipping step %d: missing target", i + 1
+                        )
+                        continue
+
                     # Coerce string enums
                     step_data["tool"]   = ToolType(step_data["tool"])
                     step_data["action"] = ActionType(step_data["action"])
+
                     if step_data.get("fallback_tool"):
                         step_data["fallback_tool"] = ToolType(
                             step_data["fallback_tool"]
                         )
+                    else:
+                        step_data["fallback_tool"] = None
+
+                    # Ensure value is string or None, never other types
+                    if step_data.get("value") is not None:
+                        step_data["value"] = str(step_data["value"])
 
                     steps.append(Step(**step_data))
 
                 except Exception as e:
-                    log.warning(
-                        "Skipping invalid step %d: %s", i + 1, e
-                    )
+                    log.warning("Skipping invalid step %d: %s", i + 1, e)
                     continue
 
             if not steps:
@@ -474,6 +559,12 @@ Rules:
                 notes = data.get("notes"),
             )
 
+            # Renumber steps after filtering
+            for idx, step in enumerate(plan.steps):
+                object.__setattr__(step, 'step_number', idx + 1) \
+                    if hasattr(step, '__setattr__') \
+                    else None
+
             return plan
 
         except Exception as e:
@@ -487,13 +578,23 @@ Rules:
 
 def _strip_markdown(text: str) -> str:
     """
-    Remove markdown code fences from a string.
-    Handles ```json ... ``` and ``` ... ``` formats.
+    Extract the first JSON object from a Gemini response.
+    Works whether the model returns:
+      - raw JSON
+      - ```json fenced JSON
+      - explanations before/after JSON
     """
     text = text.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        # Remove first line (```json or ```) and last line (```)
-        if len(lines) >= 2:
-            text = "\n".join(lines[1:-1])
+
+    # remove markdown fences
+    text = re.sub(r"```json", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"```", "", text)
+
+    # extract first complete JSON object
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start != -1 and end != -1 and end > start:
+        return text[start:end + 1].strip()
+
     return text.strip()

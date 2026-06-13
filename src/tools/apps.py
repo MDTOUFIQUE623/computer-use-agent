@@ -434,7 +434,7 @@ class SpotifyTools:
                 )
 
             # Nothing playing — use OCR to confirm and read bar state
-            from tools.ocr import _screenshot_region, _run_ocr, _words_to_text
+            from src.tools.ocr import _screenshot_region, _run_ocr, _words_to_text
 
             rect       = win32gui.GetWindowRect(hwnd)
             left, top, right, bottom = rect
@@ -482,7 +482,7 @@ class SpotifyTools:
                 and not re.match(r'^[^aeiouAEIOU]+$', l)  # ignore strings with no vowels
                 and re.search(r'[a-zA-Z]', l)             # must contain at least one letter
             ]
-            
+
             return ToolResult(
                 success=True,
                 message="Spotify open, nothing playing",
