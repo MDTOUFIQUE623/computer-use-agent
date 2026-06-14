@@ -995,7 +995,164 @@ class BrowserTools:
                 error=str(e),
                 duration_ms=_ms(start)
             )
+        
+    
+    def extract_and_summarize(
+        self,
+        selector: Optional[str] = None,
+        topic: Optional[str] = None,
+    ) -> ToolResult:
+        """
+        Extract page text then use Gemini to produce a clean summary.
+        Much more readable than raw page extraction.
+        
+        topic: what to focus the summary on
+            e.g. "Python release features" or "AI news headlines"
+        """
+        start = time.monotonic()
+        try:
+            # First extract raw text
+            extract_result = self.extract_page_text(
+                selector=selector,
+                max_chars=6000
+            )
+            if not extract_result.success:
+                return extract_result
 
+            raw_text = extract_result.data["text"]
+            page_url = extract_result.data["current_url"]
+
+            # Use Gemini to clean and summarize
+            from google import genai
+            from google.genai import types
+            from src.config import PLANNER_MODEL
+
+            client = genai.Client()
+
+            focus = f"Focus on: {topic}" if topic else ""
+            prompt = f"""
+    Clean and summarize the following web page content into 
+    a readable, well-structured text document.
+    Remove all navigation menus, advertisements, cookie notices,
+    footer text, and other UI noise.
+    Keep only the meaningful content.
+    {focus}
+    Format with clear headings and bullet points where appropriate.
+
+    Page URL: {page_url}
+
+    Content:
+    {raw_text}
+    """.strip()
+
+            response = client.models.generate_content(
+                model=PLANNER_MODEL,
+                contents=[prompt],
+                config=types.GenerateContentConfig(
+                    max_output_tokens=2000,
+                )
+            )
+
+            summary = response.text or raw_text
+
+            return ToolResult(
+                success=True,
+                message=f"Extracted and summarized {len(summary.split())} words",
+                data={
+                    "text":        summary,
+                    "word_count":  len(summary.split()),
+                    "current_url": page_url,
+                    "page_title":  extract_result.data.get("page_title", ""),
+                },
+                duration_ms=_ms(start)
+            )
+
+        except Exception as e:
+            log.error("extract_and_summarize failed: %s", e)
+            # Fall back to plain extraction
+            return self.extract_page_text(selector=selector)
+
+
+    def get_first_result_url(
+        self,
+        skip_domains: Optional[list[str]] = None,
+    ) -> ToolResult:
+        """
+        Get the URL of the first organic search result on the current page.
+        Call this after search_web, then navigate() to that URL.
+
+        skip_domains: domains to skip e.g. ["reddit.com", "youtube.com"]
+        Returns the URL and title of the first good result.
+        """
+        start = time.monotonic()
+        try:
+            self._ensure_started()
+
+            # Default domains to skip — not useful for content extraction
+            skip = set(skip_domains or [
+                "youtube.com",
+                "reddit.com",
+                "twitter.com",
+                "facebook.com",
+                "instagram.com",
+                "tiktok.com",
+            ])
+
+            # Get all links on the page
+            links = self._page.query_selector_all("a[href]")
+
+            for link in links:
+                href  = link.get_attribute("href") or ""
+                text  = (link.inner_text() or "").strip()
+
+                # Skip empty, javascript, anchors
+                if not href or not text:
+                    continue
+                if href.startswith(("javascript:", "#", "/")):
+                    continue
+                if not href.startswith("http"):
+                    continue
+
+                # Skip DuckDuckGo internal links
+                if "duckduckgo.com" in href:
+                    continue
+
+                # Skip skipped domains
+                if any(domain in href for domain in skip):
+                    continue
+
+                # Skip very short link text (likely nav elements)
+                if len(text) < 10:
+                    continue
+
+                return ToolResult(
+                    success=True,
+                    message=f"First result: '{text[:60]}'",
+                    data={
+                        "url":   href,
+                        "title": text,
+                        "current_url": self._page.url,
+                    },
+                    duration_ms=_ms(start)
+                )
+
+            return ToolResult(
+                success=False,
+                message="No suitable result URL found on page",
+                error="NoResults",
+                data={"current_url": self._page.url},
+                duration_ms=_ms(start)
+            )
+
+        except Exception as e:
+            log.error("get_first_result_url failed: %s", e)
+            return ToolResult(
+                success=False,
+                message="Failed to get first result URL",
+                error=str(e),
+                data={},
+                duration_ms=_ms(start)
+            )
 
 # ---------------------------------------------------------------------------
 # Internal helpers

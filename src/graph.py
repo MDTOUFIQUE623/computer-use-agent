@@ -183,24 +183,28 @@ def _execute_windows_ui(step: Step) -> ToolResult:
     return handler()
 
 
-def _execute_browser(step: Step) -> ToolResult:
-    from src.tools.browser import BrowserTools
-
-    # Browser instance persists for the duration of the task
-    # We use a module-level instance so it stays open between steps
+def _execute_browser(step: Step, state: GraphState) -> ToolResult:
     bt = _get_browser_instance()
 
+    # Resolve {{extracted_content}} in target
+    target = step.target
+    if target == "{{extracted_content}}":
+        target = state.get("extracted_content", step.target)
+
     action_map = {
-        ActionType.NAVIGATE:      lambda: bt.navigate(step.target),
-        ActionType.SEARCH_WEB:    lambda: bt.search_web(step.target),
-        ActionType.CLICK_ELEMENT: lambda: bt.click_element(text=step.target),
-        ActionType.FILL_FORM:     lambda: bt.fill_field(step.target, step.value or ""),
-        ActionType.EXTRACT_TEXT: lambda: (
-            bt.extract_page_text(selector=step.target)
-            if step.target and step.target not in ("body", "page", "all")
-            else bt.extract_page_text()
+        ActionType.NAVIGATE:          lambda: bt.navigate(target),
+        ActionType.SEARCH_WEB:        lambda: bt.search_web(target),
+        ActionType.CLICK_ELEMENT:     lambda: bt.click_element(text=target),
+        ActionType.FILL_FORM:         lambda: bt.fill_field(
+            target, step.value or ""
         ),
-        ActionType.WAIT_FOR_PAGE: lambda: bt.wait_for_text(step.target),
+        ActionType.EXTRACT_TEXT:      lambda: bt.extract_page_text(
+            selector=target
+            if target not in ("body", "page", "all")
+            else None
+        ),
+        ActionType.WAIT_FOR_PAGE:     lambda: bt.wait_for_text(target),
+        ActionType.GET_FIRST_RESULT:  lambda: bt.get_first_result_url(),
     }
 
     handler = action_map.get(step.action)
@@ -390,13 +394,14 @@ def _execute_step(step: Step, brain: Brain, state: GraphState) -> ToolResult:
         elif tool == ToolType.WINDOWS_UI:
             return _execute_windows_ui(resolved_step)
         elif tool == ToolType.BROWSER:
-            return _execute_browser(resolved_step)
+            return _execute_browser(resolved_step, state)
         elif tool == ToolType.APPS:
             return _execute_apps(resolved_step)
         elif tool == ToolType.OCR:
             return _execute_ocr(resolved_step)
         elif tool == ToolType.VISION:
             return _execute_vision(resolved_step, brain)
+    
         else:
             return ToolResult(
                 success=False,
@@ -517,20 +522,31 @@ def execute_node(state: GraphState) -> dict:
         files   = tool_result.data.get("files")
         matches = tool_result.data.get("matches")
         moved   = tool_result.data.get("moved")
+        url     = tool_result.data.get("url")  # from get_first_result
 
         if text:
             extracted = text
-            print(f"[EXEC] Extracted {len(text.split())} words")
+            print(f"[EXEC] Extracted {len(text.split())} words (cleaned)")
         elif files:
-            extracted = f"Files found ({len(files)}):\n" + "\n".join(files)
+            extracted = (
+                f"Files found ({len(files)}):\n" + "\n".join(files)
+            )
             print(f"[EXEC] Found {len(files)} file(s)")
         elif matches:
-            extracted = f"Matches found ({len(matches)}):\n" + "\n".join(matches)
+            extracted = (
+                f"Matches found ({len(matches)}):\n" + "\n".join(matches)
+            )
             print(f"[EXEC] Found {len(matches)} match(es)")
         elif moved:
             lines = [f"{src} → {dst}" for src, dst in moved.items()]
-            extracted = f"Files organized ({len(moved)}):\n" + "\n".join(lines)
+            extracted = (
+                f"Files organized ({len(moved)}):\n" + "\n".join(lines)
+            )
             print(f"[EXEC] Organized {len(moved)} file(s)")
+        elif url:
+            # Store URL as extracted content so navigate step can use it
+            extracted = url
+            print(f"[EXEC] First result URL: {url}")
 
     return {
         "_last_tool_result":  tool_result,
@@ -590,14 +606,6 @@ def verify_node(state: GraphState) -> dict:
 
 
 def retry_node(state: GraphState) -> dict:
-    """
-    Handle a failed step.
-
-    Strategy:
-      Retry 1: try fallback_tool if specified
-      Retry 2: ask Brain to replan the step
-      Retry 3+: give up on this step, ask user
-    """
     plan        = state["plan"]
     index       = state["current_step_index"]
     step        = plan.steps[index]
@@ -605,12 +613,8 @@ def retry_node(state: GraphState) -> dict:
 
     print(f"[RETRY] Attempt {retry_count} for step {step.step_number}")
 
-    # Too many retries — escalate
+    # Too many retries
     if retry_count > MAX_RETRIES_PER_STEP:
-        print(
-            f"[RETRY] Step {step.step_number} failed "
-            f"{MAX_RETRIES_PER_STEP} times — asking user"
-        )
         brain = Brain()
         brain.record_step_failure(
             app_name = (
@@ -620,6 +624,29 @@ def retry_node(state: GraphState) -> dict:
             step   = step,
             reason = state.get("last_error", "unknown"),
         )
+
+        # Check if this is the LAST step and core work is done
+        # If we have extracted content or completed most steps,
+        # skip this step rather than failing the whole task
+        is_last_step = index >= len(plan.steps) - 1
+        steps_completed = len(state.get("step_results", []))
+        majority_done = steps_completed >= (len(plan.steps) - 1)
+
+        if is_last_step or majority_done:
+            print(
+                f"[RETRY] Skipping optional step "
+                f"{step.step_number} — core task already complete"
+            )
+            return {
+                "retry_count":        retry_count,
+                "current_step_index": index + 1,  # advance past failed step
+                "last_error":         None,
+            }
+
+        print(
+            f"[RETRY] Step {step.step_number} failed "
+            f"{MAX_RETRIES_PER_STEP} times — asking user"
+        )
         return {
             "retry_count":    retry_count,
             "is_failed":      True,
@@ -627,8 +654,7 @@ def retry_node(state: GraphState) -> dict:
                 f"Step {step.step_number} failed after "
                 f"{MAX_RETRIES_PER_STEP} attempts.\n"
                 f"Task: {step.description}\n"
-                f"Last error: {state.get('last_error', 'unknown')}\n"
-                f"Please check if the app is open and try again."
+                f"Last error: {state.get('last_error', 'unknown')}"
             ),
         }
 
@@ -638,22 +664,20 @@ def retry_node(state: GraphState) -> dict:
             f"[RETRY] Trying fallback tool: "
             f"{step.fallback_tool.value}"
         )
-        # Temporarily swap the tool in the step
         fallback_step = Step(
-            step_number          = step.step_number,
-            tool                 = step.fallback_tool,
-            action               = step.action,
-            target               = step.target,
-            value                = step.value,
-            description          = step.description + " (fallback)",
-            expected_outcome     = step.expected_outcome,
-            fallback_tool        = None,
-            requires_verification= step.requires_verification,
+            step_number           = step.step_number,
+            tool                  = step.fallback_tool,
+            action                = step.action,
+            target                = step.target,
+            value                 = step.value,
+            description           = step.description + " (fallback)",
+            expected_outcome      = step.expected_outcome,
+            fallback_tool         = None,
+            requires_verification = step.requires_verification,
         )
-        # Replace the current step with fallback step
-        new_steps  = list(plan.steps)
+        new_steps        = list(plan.steps)
         new_steps[index] = fallback_step
-        new_plan   = Plan(
+        new_plan = Plan(
             task_summary         = plan.task_summary,
             total_steps          = plan.total_steps,
             apps_involved        = plan.apps_involved,
@@ -662,11 +686,11 @@ def retry_node(state: GraphState) -> dict:
             notes                = plan.notes,
         )
         return {
-            "plan":         new_plan,
-            "retry_count":  retry_count,
+            "plan":        new_plan,
+            "retry_count": retry_count,
         }
 
-    # Retry 2 — ask Brain to replan this step
+    # Retry 2 — ask Brain to replan
     print(f"[RETRY] Asking Brain to replan step {step.step_number}")
     brain    = Brain()
     new_step = brain.replan_step(
@@ -680,7 +704,7 @@ def retry_node(state: GraphState) -> dict:
             f"[RETRY] Replanned: [{new_step.tool.value}] "
             f"{new_step.action.value} → '{new_step.target}'"
         )
-        new_steps       = list(plan.steps)
+        new_steps        = list(plan.steps)
         new_steps[index] = new_step
         new_plan = Plan(
             task_summary         = plan.task_summary,
@@ -695,10 +719,24 @@ def retry_node(state: GraphState) -> dict:
             "retry_count": retry_count,
         }
 
-    # No replan possible — escalate
+    # No replan — skip if majority of work is done
+    steps_completed = len(state.get("step_results", []))
+    majority_done   = steps_completed >= (len(plan.steps) - 1)
+
+    if majority_done:
+        print(
+            f"[RETRY] No replan available — "
+            f"skipping step {step.step_number} (majority done)"
+        )
+        return {
+            "retry_count":        retry_count,
+            "current_step_index": index + 1,
+            "last_error":         None,
+        }
+
     return {
-        "retry_count": retry_count,
-        "is_failed":   True,
+        "retry_count":    retry_count,
+        "is_failed":      True,
         "ask_user_message": (
             f"Could not find an alternative for step "
             f"{step.step_number}: {step.description}"
@@ -865,6 +903,61 @@ def build_graph():
     workflow.add_edge("failed",   END)
 
     return workflow.compile()
+
+def _clean_web_text(text: str) -> str:
+    """
+    Remove common web page UI noise from extracted text.
+    Keeps meaningful content, removes nav/footer/cookie text.
+    """
+    import re
+
+    # Lines to remove if they contain these phrases
+    noise_phrases = [
+        "upgrade to our browser",
+        "download browser",
+        "fast. free. private",
+        "open menu",
+        "search settings",
+        "safe search",
+        "was this helpful",
+        "more results",
+        "searches related to",
+        "share feedback",
+        "privacy policy",
+        "terms of service",
+        "cookie",
+        "advertisement",
+        "skip to content",
+        "sign up",
+        "log in",
+        "subscribe",
+        "newsletter",
+    ]
+
+    lines = text.splitlines()
+    cleaned_lines = []
+
+    for line in lines:
+        line_lower = line.lower().strip()
+
+        # Skip empty lines in sequence (keep max one blank line)
+        if not line_lower:
+            if cleaned_lines and cleaned_lines[-1] != "":
+                cleaned_lines.append("")
+            continue
+
+        # Skip noise lines
+        is_noise = any(phrase in line_lower for phrase in noise_phrases)
+        if is_noise:
+            continue
+
+        # Skip very short lines that are likely UI elements
+        if len(line.strip()) < 3:
+            continue
+
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines).strip()
 
 
 # Compiled graph — imported by main.py

@@ -35,6 +35,7 @@ class ActionType(str, Enum):
     FILL_FORM     = "fill_form"
     EXTRACT_TEXT  = "extract_text"
     WAIT_FOR_PAGE = "wait_for_page"
+    GET_FIRST_RESULT = "get_first_result"
 
     # Files
     MOVE_FILE      = "move_file"

@@ -38,7 +38,20 @@ AVAILABLE TOOLS AND ACTIONS:
 
 2. browser — Browser automation via Playwright
    Actions: navigate, search_web, click_element, fill_form,
-            extract_text, wait_for_page
+            extract_text, wait_for_page, get_first_result
+
+   get_first_result: gets URL of first search result on current page
+   Use AFTER search_web to get the article URL, THEN navigate to it
+
+EXAMPLES OF CORRECT PLANS:
+  "search for X and save to file Y.txt on Desktop":
+    step 1: browser / search_web / target="X"
+    step 2: browser / get_first_result / target="search results"
+    step 3: browser / navigate / target="{{extracted_content}}"
+    step 4: browser / extract_text / target="article" or "main" or "body"
+    step 5: files / write_file
+            target="<full Desktop path>\\Y.txt"
+            value="{{extracted_content}}"
 
 3. files — File and folder operations (pure Python)
    Actions: move_file, copy_file, rename_file, delete_file,
@@ -106,6 +119,15 @@ EXAMPLES OF CORRECT PLANS:
             value="*.pdf"
     step 2: files / move_file / target="<Downloads path>"
             value="<Documents path>"
+
+  "search for X and save to file Y.txt on Desktop":
+    step 1: browser / search_web / target="X"
+    step 2: browser / navigate / target="URL of the most relevant result"
+            (use the actual article/docs URL, not the search results page)
+    step 3: browser / extract_text / target="article" or "main" or "body"
+    step 4: files / write_file
+            target="<full Desktop path>\\Y.txt"
+            value="{{extracted_content}}"
 """.strip()
 
 # ---------------------------------------------------------------------------
@@ -141,13 +163,19 @@ Rules:
 CRITICAL: Only use these exact action values:
 open_app, close_app, focus_app, click, type_text, press_key, scroll, select,
 navigate, search_web, click_element, fill_form, extract_text, wait_for_page,
-move_file, copy_file, rename_file, delete_file, create_folder, list_files,
+get_first_result, move_file, copy_file, rename_file, delete_file, create_folder, list_files,
 find_files, organize_files, write_file, spotify_play, spotify_pause, spotify_next,
 spotify_playlist, notion_create_page, notion_append, clipboard_copy,
 clipboard_paste, volume_set, wait, screenshot
 
-Never invent action names. Never use: respond, display, show, open_url, type.
-target must always be a non-empty string. Never set target to null.
+- Never invent action names. Never use: respond, display, show, open_url, type.
+   target must always be a non-empty string. Never set target to null.
+
+- NEVER add organize_files as a final step after write_file
+- NEVER add steps to "ensure" or "confirm" or "verify" file operations
+  — the verifier handles that automatically
+- After writing a file with write_file, the task is complete
+- Do not add cleanup or organization steps unless explicitly asked
 
 Respond ONLY with valid JSON matching the Plan schema.
 No markdown, no explanation outside the JSON.
@@ -270,19 +298,10 @@ class Brain:
         failure_reason: str,
         attempt: int,
     ) -> Optional[Step]:
-        """
-        Ask Gemini to suggest an alternative approach for a failed step.
-
-        Called by graph.py when a step fails and retries are exhausted.
-        Returns a new Step with a different tool/action, or None if
-        no alternative is possible.
-
-        attempt: which replan attempt this is (1 or 2)
-        """
         if attempt > MAX_REPLAN_ATTEMPTS:
             log.warning(
                 "Max replan attempts reached for step %d",
-                original_step.step_number,
+                original_step.step_number
             )
             return None
 
@@ -306,23 +325,20 @@ class Brain:
 
     {TOOL_CATALOGUE}
 
-    Return ONLY a JSON object for the replacement step:
+    Return ONLY a JSON object for the replacement step.
+    If no alternative exists, return {{"impossible": true}}
+
     {{
     "step_number": {original_step.step_number},
-    "tool": "different_tool_than_{original_step.tool.value}",
+    "tool": "tool_name",
     "action": "action_name",
     "target": "what to act on",
     "value": null,
-    "description": "what this alternative step does",
-    "expected_outcome": "what should be true if this succeeds",
+    "description": "what this does",
+    "expected_outcome": "what success looks like",
     "fallback_tool": null,
     "requires_verification": true
     }}
-
-    Rules:
-    - Do NOT suggest the same tool that just failed
-    - Use the simplest alternative approach
-    - If no alternative exists, return {{"impossible": true}}
     """.strip()
 
         try:
@@ -331,33 +347,38 @@ class Brain:
                 contents=[prompt],
                 config=types.GenerateContentConfig(
                     max_output_tokens=500,
-                ),
+                )
             )
 
-            raw = response.text or ""
+            raw = (response.text or "").strip()
+
+            # Handle empty response
+            if not raw:
+                log.info("Replan returned empty response — step impossible")
+                return None
+
             raw = _strip_markdown(raw)
+
+            # Handle empty after stripping
+            if not raw:
+                log.info("Replan returned empty after strip — step impossible")
+                return None
 
             data = json.loads(raw)
 
-            # Gemini determined no alternative exists
             if data.get("impossible"):
                 log.info("Replan determined step is impossible")
                 return None
 
-            # Validate required fields before building Step
+            # Validate required fields
             if not data.get("target"):
-                log.warning(
-                    "Replan returned no target for step %d",
-                    original_step.step_number,
-                )
+                log.warning("Replan returned no target")
                 return None
 
-            # Normalize value type
             if data.get("value") is not None:
                 data["value"] = str(data["value"])
 
-            # Convert string values to enums
-            data["tool"] = ToolType(data["tool"])
+            data["tool"]   = ToolType(data["tool"])
             data["action"] = ActionType(data["action"])
 
             if data.get("fallback_tool"):
@@ -367,10 +388,9 @@ class Brain:
 
             return Step(**data)
 
-        except (json.JSONDecodeError, ValueError) as e:
+        except json.JSONDecodeError as e:
             log.error("Invalid replan response: %s", e)
             return None
-
         except Exception as e:
             log.error("replan_step failed: %s", e)
             return None
