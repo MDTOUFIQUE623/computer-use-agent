@@ -495,6 +495,47 @@ class FileTools:
                 error=str(e),
                 duration_ms=_ms(start)
             )
+        
+    def write_file(
+        self,
+        path: str,
+        content: str,
+        append: bool = False,
+    ) -> ToolResult:
+        """
+        Write text content to a file.
+        Creates the file if it doesn't exist.
+        append=True adds to existing content instead of overwriting.
+        """
+        start = time.monotonic()
+        try:
+            p = Path(path).resolve()
+            p.parent.mkdir(parents=True, exist_ok=True)
+
+            mode = "a" if append else "w"
+            with open(p, mode, encoding="utf-8") as f:
+                f.write(content)
+
+            size = p.stat().st_size
+            return ToolResult(
+                success=True,
+                message=f"{'Appended to' if append else 'Wrote'} '{p.name}' ({size} bytes)",
+                data={
+                    "path":    str(p),
+                    "size":    size,
+                    "append":  append,
+                },
+                duration_ms=_ms(start)
+            )
+
+        except Exception as e:
+            log.error("write_file failed: %s", e)
+            return ToolResult(
+                success=False,
+                message=f"Failed to write '{path}'",
+                error=str(e),
+                duration_ms=_ms(start)
+            )
 
 
 # ---------------------------------------------------------------------------
