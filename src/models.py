@@ -45,6 +45,7 @@ class ActionType(str, Enum):
     LIST_FILES     = "list_files"
     FIND_FILES     = "find_files"
     ORGANIZE_FILES = "organize_files"
+    WRITE_FILE     = "write_file"
 
     # App APIs
     SPOTIFY_PLAY     = "spotify_play"
