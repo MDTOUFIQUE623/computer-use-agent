@@ -38,19 +38,36 @@ AVAILABLE TOOLS AND ACTIONS:
 
 2. browser — Browser automation via Playwright
    Actions: navigate, search_web, click_element, fill_form,
-            extract_text, wait_for_page, get_first_result
+            extract_text, wait_for_page, get_first_result,
+            search_and_extract, search_extract_and_summarize
 
-   get_first_result: gets URL of first search result on current page
-   Use AFTER search_web to get the article URL, THEN navigate to it
+   HIGH-LEVEL ACTIONS (prefer these):
+   search_and_extract(target=query):
+     Searches, finds best result, navigates to it, extracts clean text.
+     Use for: "find information about X and save to file"
+
+   search_extract_and_summarize(target=query, value=topic_focus):
+     Same as above but also summarizes with Gemini.
+     Use for: "research X and give me a summary" or
+              "find X and save a readable summary to file"
+
+   LOW-LEVEL ACTIONS (only when you need specific control):
+   search_web → navigate → extract_text
+   Use for: when you need to visit a specific URL you already know
 
 EXAMPLES OF CORRECT PLANS:
   "search for X and save to file Y.txt on Desktop":
-    step 1: browser / search_web / target="X"
-    step 2: browser / get_first_result / target="search results"
-    step 3: browser / navigate / target="{{extracted_content}}"
-    step 4: browser / extract_text / target="article" or "main" or "body"
-    step 5: files / write_file
-            target="<full Desktop path>\\Y.txt"
+    step 1: browser / search_and_extract / target="X"
+    step 2: files / write_file
+            target="<Desktop path>\\Y.txt"
+            value="{{extracted_content}}"
+
+  "research X and save a summary to file Y.txt":
+    step 1: browser / search_extract_and_summarize
+            target="X"
+            value="key features and highlights"
+    step 2: files / write_file
+            target="<Desktop path>\\Y.txt"
             value="{{extracted_content}}"
 
 3. files — File and folder operations (pure Python)
@@ -252,6 +269,11 @@ class Brain:
         start = time.monotonic()
         log.info("Planning task: %s", task)
 
+        preprocessed = self._preprocess_task(task)
+        if preprocessed:
+            log.info("Using preprocessed plan for task")
+            return preprocessed
+
         # Step 1 — load memory hints
         hints = mem.get_memory_hints(task)
         if hints:
@@ -291,6 +313,133 @@ class Brain:
             )
 
         return plan
+    
+
+    def _preprocess_task(self, task: str) -> Optional[Plan]:
+        """
+        Detect common task patterns and return a Plan directly
+        without calling Gemini. This avoids low-level planning
+        for well-understood task types.
+
+        Patterns detected:
+        - research + save: "search for X and save to file Y"
+        - research + summarize: "search for X and summarize"
+        - research only: "search for X and tell me"
+        """
+        import os
+        import re
+
+        task_lower = task.lower()
+
+        # Detect: research + save to file
+        save_to_file = (
+            "save" in task_lower
+            and ("file" in task_lower or ".txt" in task_lower or ".md" in task_lower)
+            and any(w in task_lower for w in ["search", "find", "look up", "research"])
+        )
+
+        # Detect: research + summarize (no save)
+        summarize_only = (
+            any(w in task_lower for w in ["search", "find", "look up", "research"])
+            and any(w in task_lower for w in ["summarize", "summary", "tell me", "what is"])
+            and not save_to_file
+        )
+
+        if not save_to_file and not summarize_only:
+            return None
+
+        # Extract file name if saving
+        file_name = None
+        if save_to_file:
+            # Look for .txt or .md filename
+            match = re.search(r'[\w_-]+\.(txt|md|csv)', task_lower)
+            if match:
+                file_name = match.group(0)
+            else:
+                file_name = "research_output.txt"
+
+        # Extract search query — everything between "search for" and action words
+        query = task
+        for prefix in ["search for", "look up", "find", "research"]:
+            if prefix in task_lower:
+                idx   = task_lower.index(prefix) + len(prefix)
+                query = task[idx:].strip()
+                # Trim at action words
+                for stop in [", extract", ", summarize", ", save", " and save",
+                            " and tell", " and summarize", " and extract"]:
+                    if stop in query.lower():
+                        query = query[:query.lower().index(stop)].strip()
+                break
+
+        home    = os.path.expanduser("~")
+        desktop = (
+            os.path.join(home, "OneDrive", "Desktop")
+            if os.path.exists(os.path.join(home, "OneDrive", "Desktop"))
+            else os.path.join(home, "Desktop")
+        )
+
+        if save_to_file and file_name:
+            file_path = os.path.join(desktop, file_name)
+
+            steps = [
+                Step(
+                    step_number           = 1,
+                    tool                  = ToolType.BROWSER,
+                    action                = ActionType.SEARCH_EXTRACT_AND_SUMMARIZE,
+                    target                = query,
+                    value                 = "key features and highlights",
+                    description           = f"Research: {query}",
+                    expected_outcome      = "Clean summary text extracted",
+                    fallback_tool         = None,
+                    requires_verification = False,
+                ),
+                Step(
+                    step_number           = 2,
+                    tool                  = ToolType.FILES,
+                    action                = ActionType.WRITE_FILE,
+                    target                = file_path,
+                    value                 = "{{extracted_content}}",
+                    description           = f"Save research to {file_name}",
+                    expected_outcome      = f"File {file_name} exists on Desktop",
+                    fallback_tool         = None,
+                    requires_verification = True,
+                ),
+            ]
+
+            return Plan(
+                task_summary         = f"Research '{query}' and save to {file_name}",
+                total_steps          = 2,
+                apps_involved        = ["browser"],
+                estimated_complexity = "simple",
+                steps                = steps,
+                notes                = None,
+            )
+
+        if summarize_only:
+            steps = [
+                Step(
+                    step_number           = 1,
+                    tool                  = ToolType.BROWSER,
+                    action                = ActionType.SEARCH_EXTRACT_AND_SUMMARIZE,
+                    target                = query,
+                    value                 = None,
+                    description           = f"Research and summarize: {query}",
+                    expected_outcome      = "Summary text ready to display",
+                    fallback_tool         = None,
+                    requires_verification = False,
+                ),
+            ]
+
+            return Plan(
+                task_summary         = f"Research and summarize: {query}",
+                total_steps          = 1,
+                apps_involved        = ["browser"],
+                estimated_complexity = "simple",
+                steps                = steps,
+                notes                = None,
+            )
+
+        return None
 
     def replan_step(
         self,

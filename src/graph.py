@@ -203,6 +203,12 @@ def _execute_browser(step: Step, state: GraphState) -> ToolResult:
             if target not in ("body", "page", "all")
             else None
         ),
+        ActionType.SEARCH_AND_EXTRACT: lambda: bt.search_and_extract(
+            target
+        ),
+        ActionType.SEARCH_EXTRACT_AND_SUMMARIZE: lambda: bt.search_extract_and_summarize(
+            target, step.value
+        ),
         ActionType.WAIT_FOR_PAGE:     lambda: bt.wait_for_text(target),
         ActionType.GET_FIRST_RESULT:  lambda: bt.get_first_result_url(),
     }
@@ -904,60 +910,7 @@ def build_graph():
 
     return workflow.compile()
 
-def _clean_web_text(text: str) -> str:
-    """
-    Remove common web page UI noise from extracted text.
-    Keeps meaningful content, removes nav/footer/cookie text.
-    """
-    import re
 
-    # Lines to remove if they contain these phrases
-    noise_phrases = [
-        "upgrade to our browser",
-        "download browser",
-        "fast. free. private",
-        "open menu",
-        "search settings",
-        "safe search",
-        "was this helpful",
-        "more results",
-        "searches related to",
-        "share feedback",
-        "privacy policy",
-        "terms of service",
-        "cookie",
-        "advertisement",
-        "skip to content",
-        "sign up",
-        "log in",
-        "subscribe",
-        "newsletter",
-    ]
-
-    lines = text.splitlines()
-    cleaned_lines = []
-
-    for line in lines:
-        line_lower = line.lower().strip()
-
-        # Skip empty lines in sequence (keep max one blank line)
-        if not line_lower:
-            if cleaned_lines and cleaned_lines[-1] != "":
-                cleaned_lines.append("")
-            continue
-
-        # Skip noise lines
-        is_noise = any(phrase in line_lower for phrase in noise_phrases)
-        if is_noise:
-            continue
-
-        # Skip very short lines that are likely UI elements
-        if len(line.strip()) < 3:
-            continue
-
-        cleaned_lines.append(line)
-
-    return "\n".join(cleaned_lines).strip()
 
 
 # Compiled graph — imported by main.py

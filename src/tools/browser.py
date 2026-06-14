@@ -1153,6 +1153,175 @@ class BrowserTools:
                 data={},
                 duration_ms=_ms(start)
             )
+        
+
+    def search_and_extract(
+        self,
+        query: str,
+        selector: str = "article",
+    ) -> ToolResult:
+        """
+        Complete research operation in one call.
+        Internally: search → get first result → navigate → extract → clean.
+        Returns clean article text ready to write to file.
+        """
+        start = time.monotonic()
+        try:
+            # Step 1 — search
+            search_result = self.search_web(query)
+            if not search_result.success:
+                return search_result
+
+            # Step 2 — get first result URL
+            url_result = self.get_first_result_url()
+            if not url_result.success:
+                # Fall back to extracting search results page
+                return self.extract_page_text()
+
+            target_url = url_result.data["url"]
+            log.info("search_and_extract: navigating to %s", target_url)
+
+            # Step 3 — navigate to article
+            nav_result = self.navigate(target_url)
+            if not nav_result.success:
+                # Fall back to search results page
+                return self.extract_page_text()
+
+            # Step 4 — wait for content to load
+            import time as t
+            t.sleep(1.5)
+
+            # Step 5 — extract with smart selector fallback
+            for sel in [selector, "article", "main", ".content", "body"]:
+                extract_result = self.extract_page_text(
+                    selector=sel,
+                    max_chars=8000
+                )
+                if (
+                    extract_result.success
+                    and extract_result.data.get("word_count", 0) > 100
+                ):
+                    # Step 6 — clean the text
+                    cleaned = _clean_web_text(extract_result.data["text"])
+                    word_count = len(cleaned.split())
+
+                    return ToolResult(
+                        success=True,
+                        message=(
+                            f"Research complete: {word_count} words "
+                            f"from {target_url}"
+                        ),
+                        data={
+                            "text":        cleaned,
+                            "word_count":  word_count,
+                            "source_url":  target_url,
+                            "page_title":  extract_result.data.get(
+                                "page_title", ""
+                            ),
+                            "current_url": self._page.url,
+                        },
+                        duration_ms=_ms(start)
+                    )
+
+            return ToolResult(
+                success=False,
+                message="Could not extract meaningful content",
+                error="ExtractionFailed",
+                data={},
+                duration_ms=_ms(start)
+            )
+
+        except Exception as e:
+            log.error("search_and_extract failed: %s", e)
+            return ToolResult(
+                success=False,
+                message="search_and_extract failed",
+                error=str(e),
+                data={},
+                duration_ms=_ms(start)
+            )
+
+
+    def search_extract_and_summarize(
+        self,
+        query: str,
+        topic: Optional[str] = None,
+    ) -> ToolResult:
+        """
+        Complete research + summarization in one call.
+        Internally: search_and_extract → Gemini summarize.
+        Returns concise, clean summary ready for display or saving.
+        """
+        start = time.monotonic()
+
+        # First get the raw content
+        extract_result = self.search_and_extract(query)
+        if not extract_result.success:
+            return extract_result
+
+        raw_text   = extract_result.data["text"]
+        source_url = extract_result.data.get("source_url", "")
+
+        # Then summarize with Gemini
+        try:
+            from google import genai
+            from google.genai import types
+            from config import PLANNER_MODEL
+
+            client = genai.Client()
+            focus  = f"Focus specifically on: {topic}" if topic else ""
+
+            prompt = f"""
+    Summarize the following web content into a clean, 
+    readable document with clear structure.
+
+    Requirements:
+    - Use clear headings (##) for major sections
+    - Use bullet points for lists of features/items
+    - Remove all navigation, ads, cookie notices, footer text
+    - Keep only meaningful content relevant to the topic
+    - Write in plain English, no jargon
+    - Aim for 300-500 words
+    {focus}
+
+    Source: {source_url}
+
+    Content:
+    {raw_text[:6000]}
+    """.strip()
+
+            response = client.models.generate_content(
+                model=PLANNER_MODEL,
+                contents=[prompt],
+                config=types.GenerateContentConfig(
+                    max_output_tokens=1500,
+                )
+            )
+
+            summary    = response.text or raw_text
+            word_count = len(summary.split())
+
+            return ToolResult(
+                success=True,
+                message=f"Research + summary: {word_count} words",
+                data={
+                    "text":        summary,
+                    "word_count":  word_count,
+                    "source_url":  source_url,
+                    "raw_length":  len(raw_text),
+                    "current_url": self._page.url,
+                },
+                duration_ms=_ms(start)
+            )
+
+        except Exception as e:
+            log.error("Summarization failed, returning raw: %s", e)
+            # Return raw extract if summarization fails
+            return extract_result
+
+
+
+    
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -1166,3 +1335,58 @@ def _url_encode(text: str) -> str:
     """Simple URL encoding for search queries."""
     from urllib.parse import quote_plus
     return quote_plus(text)
+
+def _clean_web_text(text: str) -> str:
+        """
+        Remove common web page UI noise from extracted text.
+        Keeps meaningful content, removes nav/footer/cookie text.
+        """
+        import re
+
+        # Lines to remove if they contain these phrases
+        noise_phrases = [
+            "upgrade to our browser",
+            "download browser",
+            "fast. free. private",
+            "open menu",
+            "search settings",
+            "safe search",
+            "was this helpful",
+            "more results",
+            "searches related to",
+            "share feedback",
+            "privacy policy",
+            "terms of service",
+            "cookie",
+            "advertisement",
+            "skip to content",
+            "sign up",
+            "log in",
+            "subscribe",
+            "newsletter",
+        ]
+
+        lines = text.splitlines()
+        cleaned_lines = []
+
+        for line in lines:
+            line_lower = line.lower().strip()
+
+            # Skip empty lines in sequence (keep max one blank line)
+            if not line_lower:
+                if cleaned_lines and cleaned_lines[-1] != "":
+                    cleaned_lines.append("")
+                continue
+
+            # Skip noise lines
+            is_noise = any(phrase in line_lower for phrase in noise_phrases)
+            if is_noise:
+                continue
+
+            # Skip very short lines that are likely UI elements
+            if len(line.strip()) < 3:
+                continue
+
+            cleaned_lines.append(line)
+
+        return "\n".join(cleaned_lines).strip()
