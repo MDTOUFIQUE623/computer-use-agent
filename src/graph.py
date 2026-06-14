@@ -129,6 +129,10 @@ def _execute_files(step: Step) -> ToolResult:
             target, value or "*"
         ),
         ActionType.ORGANIZE_FILES: lambda: ft.organize_by_type(target),
+        ActionType.WRITE_FILE: lambda: ft.write_file(
+            target,
+            value or ""
+        ),
     }
 
     handler = action_map.get(step.action)
@@ -162,6 +166,9 @@ def _execute_windows_ui(step: Step) -> ToolResult:
         ),
         ActionType.SELECT:     lambda: ui.click_element_by_name(
             step.target, control_type="ListItem"
+        ),
+        ActionType.PRESS_KEY: lambda: ui.press_key(
+            step.value or step.target  # key is in value, target is the app
         ),
     }
 
@@ -254,12 +261,21 @@ def _execute_apps(step: Step) -> ToolResult:
 
 def _execute_ocr(step: Step) -> ToolResult:
     from src.tools.ocr import OCRTools
+    import pyautogui
+
     ocr = OCRTools()
 
     if step.action == ActionType.CLICK:
-        result = ocr.find_text_in_window(step.target, step.value or "")
+        # step.target is the text to find on screen
+        # step.value is the app window to search in (optional)
+        if step.value:
+            # Search in specific window
+            result = ocr.find_text_in_window(step.value, step.target)
+        else:
+            # Search full screen
+            result = ocr.find_text_on_screen(step.target)
+
         if result.success:
-            import pyautogui
             pyautogui.click(
                 result.data["center_x"],
                 result.data["center_y"]
@@ -267,12 +283,11 @@ def _execute_ocr(step: Step) -> ToolResult:
         return result
 
     if step.action == ActionType.TYPE_TEXT:
-        import pyautogui
-        pyautogui.write(step.value or "", interval=0.05)
+        pyautogui.write(step.value or step.target, interval=0.05)
         return ToolResult(
             success=True,
-            message=f"Typed '{step.value}' via OCR fallback",
-            data={"field_value": step.value or ""}
+            message=f"Typed via OCR fallback",
+            data={"field_value": step.value or step.target}
         )
 
     return ToolResult(
@@ -336,26 +351,52 @@ def _close_browser_instance():
 # Route to correct executor
 # ---------------------------------------------------------------------------
 
-def _execute_step(step: Step, brain: Brain) -> ToolResult:
+def _execute_step(step: Step, brain: Brain, state: GraphState) -> ToolResult:
     """
     Route a step to the correct tool executor.
-    Returns ToolResult from whichever tool ran.
+    Resolves {{extracted_content}} placeholder in step values.
     """
-    tool = step.tool
+    # Resolve content placeholder
+    resolved_step = step
+    if step.value and "{{extracted_content}}" in step.value:
+        extracted = state.get("extracted_content", "")
+        if not extracted:
+            return ToolResult(
+                success=False,
+                message="No extracted content available to write",
+                error="NoContent",
+                data={}
+            )
+        # Replace placeholder with actual content
+        # Truncate to reasonable file size
+        content = extracted[:10000]
+        resolved_step = Step(
+            step_number           = step.step_number,
+            tool                  = step.tool,
+            action                = step.action,
+            target                = step.target,
+            value                 = content,
+            description           = step.description,
+            expected_outcome      = step.expected_outcome,
+            fallback_tool         = step.fallback_tool,
+            requires_verification = step.requires_verification,
+        )
+
+    tool = resolved_step.tool
 
     try:
         if tool == ToolType.FILES:
-            return _execute_files(step)
+            return _execute_files(resolved_step)
         elif tool == ToolType.WINDOWS_UI:
-            return _execute_windows_ui(step)
+            return _execute_windows_ui(resolved_step)
         elif tool == ToolType.BROWSER:
-            return _execute_browser(step)
+            return _execute_browser(resolved_step)
         elif tool == ToolType.APPS:
-            return _execute_apps(step)
+            return _execute_apps(resolved_step)
         elif tool == ToolType.OCR:
-            return _execute_ocr(step)
+            return _execute_ocr(resolved_step)
         elif tool == ToolType.VISION:
-            return _execute_vision(step, brain)
+            return _execute_vision(resolved_step, brain)
         else:
             return ToolResult(
                 success=False,
@@ -456,11 +497,11 @@ def execute_node(state: GraphState) -> dict:
     print(
         f"[EXEC] [{step.tool.value}] "
         f"{step.action.value} → '{step.target}'"
-        + (f" = '{step.value}'" if step.value else "")
+        + (f" = '{step.value[:50]}...'" if step.value and len(step.value) > 50 else f" = '{step.value}'" if step.value else "")
     )
 
     brain       = Brain()
-    tool_result = _execute_step(step, brain)
+    tool_result = _execute_step(step, brain, state)  # pass state
 
     print(
         f"[EXEC] Result: {'✓' if tool_result.success else '✗'} "
@@ -469,17 +510,31 @@ def execute_node(state: GraphState) -> dict:
     if tool_result.error:
         print(f"[EXEC] Error: {tool_result.error}")
 
-    # Capture extracted text for display at completion
+    # Capture content for cross-step passing
     extracted = state.get("extracted_content")
     if tool_result.success and tool_result.data:
-        text = tool_result.data.get("text")
+        text    = tool_result.data.get("text")
+        files   = tool_result.data.get("files")
+        matches = tool_result.data.get("matches")
+        moved   = tool_result.data.get("moved")
+
         if text:
-            extracted = text  # store latest extraction
+            extracted = text
             print(f"[EXEC] Extracted {len(text.split())} words")
+        elif files:
+            extracted = f"Files found ({len(files)}):\n" + "\n".join(files)
+            print(f"[EXEC] Found {len(files)} file(s)")
+        elif matches:
+            extracted = f"Matches found ({len(matches)}):\n" + "\n".join(matches)
+            print(f"[EXEC] Found {len(matches)} match(es)")
+        elif moved:
+            lines = [f"{src} → {dst}" for src, dst in moved.items()]
+            extracted = f"Files organized ({len(moved)}):\n" + "\n".join(lines)
+            print(f"[EXEC] Organized {len(moved)} file(s)")
 
     return {
-        "_last_tool_result": tool_result,
-        "extracted_content": extracted,
+        "_last_tool_result":  tool_result,
+        "extracted_content":  extracted,
     }
 
 

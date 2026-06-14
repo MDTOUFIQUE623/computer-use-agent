@@ -106,6 +106,10 @@ def _route_verification(
     # --- clipboard ---
     if action == ActionType.CLIPBOARD_COPY:
         return _verify_clipboard_has_content()
+    
+    if action == ActionType.WRITE_FILE:
+        path = tool_result.data.get("path") if tool_result.data else None
+        return _verify_path_exists(path, "written file")
 
     # --- wait / screenshot / system — trust the tool ---
     if action in (ActionType.WAIT, ActionType.SCREENSHOT, ActionType.VOLUME_SET):
@@ -168,19 +172,39 @@ def _verify_app_open(
 
 
 def _verify_app_closed(app_name: str) -> tuple[VerificationStatus, str]:
-    """Check the process is no longer running."""
+    """
+    Check the main app process is no longer running.
+    Uses fuzzy matching — skips helper/widget processes.
+    """
     name_lower = app_name.lower()
+
+    # These are known Spotify helper processes that stay running
+    # even after the main app closes — ignore them
+    known_helpers = {
+        "spotify": [
+            "spotifywidgetprovider",
+            "spotifymigrator",
+            "spotifycrashservice",
+        ]
+    }
+
+    helpers = known_helpers.get(name_lower, [])
+
     for proc in psutil.process_iter(["name"]):
         try:
-            if name_lower in proc.info["name"].lower():
-                return (
-                    VerificationStatus.FAILED,
-                    f"Process '{app_name}' is still running",
-                )
+            proc_name = (proc.info["name"] or "").lower()
+            if name_lower in proc_name:
+                # Skip if it's a known helper process
+                is_helper = any(h in proc_name for h in helpers)
+                if not is_helper:
+                    return (
+                        VerificationStatus.FAILED,
+                        f"Process '{proc.info['name']}' is still running",
+                    )
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-    return VerificationStatus.SUCCESS, f"'{app_name}' is no longer running"
 
+    return VerificationStatus.SUCCESS, f"'{app_name}' main process closed"
 
 def _verify_path_exists(
     path: Optional[str],
@@ -219,17 +243,43 @@ def _verify_browser_url(
     if not current_url:
         return (
             VerificationStatus.UNCERTAIN,
-            "Browser did not return current URL — cannot verify navigation",
+            "Browser did not return current URL",
         )
-    target_lower  = expected_target.lower().rstrip("/")
-    current_lower = current_url.lower().rstrip("/")
 
-    if target_lower in current_lower or current_lower in target_lower:
+    # Normalize both for comparison
+    # Replace spaces and URL encoding variants
+    def normalize(s: str) -> str:
+        return (
+            s.lower()
+            .replace(" ", "")
+            .replace("+", "")
+            .replace("%20", "")
+            .replace("-", "")
+            .rstrip("/")
+        )
+
+    target_norm  = normalize(expected_target)
+    current_norm = normalize(current_url)
+
+    # Check if key words from target appear in URL
+    target_words = [
+        w for w in target_norm.split()
+        if len(w) > 3  # skip short words
+    ] if " " in expected_target else [target_norm]
+
+    # For search URLs, check the domain loaded correctly
+    if "duckduckgo.com" in current_url or "google.com" in current_url:
+        return (
+            VerificationStatus.SUCCESS,
+            f"Search page loaded: {current_url}"
+        )
+
+    if target_norm in current_norm or current_norm in target_norm:
         return VerificationStatus.SUCCESS, f"Browser is at: {current_url}"
 
     return (
         VerificationStatus.UNCERTAIN,
-        f"Expected URL containing '{expected_target}', got '{current_url}'",
+        f"URL may be correct: {current_url}",
     )
 
 

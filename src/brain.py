@@ -42,7 +42,8 @@ AVAILABLE TOOLS AND ACTIONS:
 
 3. files — File and folder operations (pure Python)
    Actions: move_file, copy_file, rename_file, delete_file,
-            create_folder, list_files, find_files, organize_files
+            create_folder, list_files, find_files, organize_files,
+            write_file
 
 4. apps — App-specific integrations
    Actions: spotify_play, spotify_pause, spotify_next,
@@ -63,6 +64,9 @@ TOOL PRIORITY ORDER (use the first tool that can handle the step):
 
 ROUTING RULES:
   - File/folder tasks → always use files tool
+  - Writing content to a file → files / write_file
+    target = full file path, value = {{extracted_content}} if content
+    came from a previous browser extract_text step
   - Browser/web tasks → always use browser tool
   - Opening native Windows apps → use windows_ui
   - Spotify control → use apps tool
@@ -70,6 +74,12 @@ ROUTING RULES:
   - Electron apps (WhatsApp, Spotify UI) → use ocr as primary,
     vision as fallback
   - Unknown UI elements → try windows_ui first, then ocr, then vision
+
+PASSING CONTENT BETWEEN STEPS:
+  If a step extracts text (browser/extract_text) and a later step
+  needs to write that text to a file (files/write_file),
+  set the write_file value to exactly: {{extracted_content}}
+  The agent will automatically substitute the extracted text.
 
 EXAMPLES OF CORRECT PLANS:
   "play music on Spotify":
@@ -81,11 +91,21 @@ EXAMPLES OF CORRECT PLANS:
     step 2: browser / extract_text / target="body"
 
   "create folder X on Desktop":
-    step 1: files / create_folder / target="<full Desktop path>" / value="X"
+    step 1: files / create_folder / target="<full Desktop path>"
+            value="X"
+
+  "search for X and save to file Y.txt on Desktop":
+    step 1: browser / search_web / target="X"
+    step 2: browser / extract_text / target="body"
+    step 3: files / write_file
+            target="<full Desktop path>\\Y.txt"
+            value="{{extracted_content}}"
 
   "move PDFs from Downloads to Documents":
-    step 1: files / find_files / target="<Downloads path>" / value="*.pdf"
-    step 2: files / move_file / target="<Downloads path>" / value="<Documents path>"
+    step 1: files / find_files / target="<Downloads path>"
+            value="*.pdf"
+    step 2: files / move_file / target="<Downloads path>"
+            value="<Documents path>"
 """.strip()
 
 # ---------------------------------------------------------------------------
@@ -105,37 +125,32 @@ Rules:
 - Each step must be atomic — one action, one target
 - Use the simplest tool that can accomplish each step
 - File operations never need UI tools — use the files tool directly
-- Web research: use browser tool + extract_text to get page content
-  as text. Never use vision for web pages.
+- Web research: use browser / search_web then browser / extract_text
+  Do NOT add wait_for_page steps — search_web already waits for load
 - Always set expected_outcome — this is how the verifier checks success
 - Set fallback_tool when a step might fail on the primary tool
 - Set requires_verification=false only for wait and volume actions
 - Keep total_steps under 20
+- ONLY plan what was explicitly asked — do not add extra steps
+  like saving files, closing apps, or confirming dialogs unless asked
+- If the task says "write X in Notepad" — just open and type, nothing else
+- If the task says "search for X" — just search and extract, nothing else
 - If the task is impossible or unclear, set total_steps=0
   and explain in notes
-
-Respond ONLY with valid JSON matching the Plan schema.
-No markdown, no explanation outside the JSON.
-
-IMPORTANT:
-
-- Return ONLY one valid JSON object.
-- Do NOT wrap it in ```json fences.
-- Do NOT include explanations.
-- Do NOT include notes before or after the JSON.
-- The first character of the response must be {
-- The last character of the response must be }
 
 CRITICAL: Only use these exact action values:
 open_app, close_app, focus_app, click, type_text, press_key, scroll, select,
 navigate, search_web, click_element, fill_form, extract_text, wait_for_page,
 move_file, copy_file, rename_file, delete_file, create_folder, list_files,
-find_files, organize_files, spotify_play, spotify_pause, spotify_next,
+find_files, organize_files, write_file, spotify_play, spotify_pause, spotify_next,
 spotify_playlist, notion_create_page, notion_append, clipboard_copy,
 clipboard_paste, volume_set, wait, screenshot
 
 Never invent action names. Never use: respond, display, show, open_url, type.
 target must always be a non-empty string. Never set target to null.
+
+Respond ONLY with valid JSON matching the Plan schema.
+No markdown, no explanation outside the JSON.
 """.strip()
 
 
