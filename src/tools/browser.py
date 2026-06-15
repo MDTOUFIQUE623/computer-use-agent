@@ -1075,72 +1075,84 @@ class BrowserTools:
 
     def get_first_result_url(
         self,
+        query: Optional[str] = None,
         skip_domains: Optional[list[str]] = None,
     ) -> ToolResult:
         """
-        Get the URL of the first organic search result on the current page.
-        Call this after search_web, then navigate() to that URL.
-
-        skip_domains: domains to skip e.g. ["reddit.com", "youtube.com"]
-        Returns the URL and title of the first good result.
+        Get the URL of the most relevant search result.
+        If query is provided, scores links by keyword relevance.
         """
         start = time.monotonic()
         try:
             self._ensure_started()
 
-            # Default domains to skip — not useful for content extraction
             skip = set(skip_domains or [
-                "youtube.com",
-                "reddit.com",
-                "twitter.com",
-                "facebook.com",
-                "instagram.com",
-                "tiktok.com",
+                "youtube.com", "reddit.com", "twitter.com",
+                "facebook.com", "instagram.com", "tiktok.com",
             ])
 
-            # Get all links on the page
             links = self._page.query_selector_all("a[href]")
 
+            candidates = []
             for link in links:
-                href  = link.get_attribute("href") or ""
-                text  = (link.inner_text() or "").strip()
+                href = link.get_attribute("href") or ""
+                text = (link.inner_text() or "").strip()
 
-                # Skip empty, javascript, anchors
                 if not href or not text:
                     continue
                 if href.startswith(("javascript:", "#", "/")):
                     continue
                 if not href.startswith("http"):
                     continue
-
-                # Skip DuckDuckGo internal links
                 if "duckduckgo.com" in href:
                     continue
-
-                # Skip skipped domains
                 if any(domain in href for domain in skip):
                     continue
-
-                # Skip very short link text (likely nav elements)
                 if len(text) < 10:
                     continue
 
+                # Score by relevance
+                score = 0
+                if query:
+                    query_words = query.lower().split()
+                    href_lower  = href.lower()
+                    text_lower  = text.lower()
+                    for word in query_words:
+                        if word in href_lower:
+                            score += 2
+                        if word in text_lower:
+                            score += 1
+
+                # Prefer official docs
+                if "docs." in href or "/docs/" in href:
+                    score += 3
+                if "official" in text.lower():
+                    score += 2
+
+                candidates.append((score, href, text))
+
+            if not candidates:
                 return ToolResult(
-                    success=True,
-                    message=f"First result: '{text[:60]}'",
-                    data={
-                        "url":   href,
-                        "title": text,
-                        "current_url": self._page.url,
-                    },
+                    success=False,
+                    message="No suitable result URL found",
+                    error="NoResults",
+                    data={"current_url": self._page.url},
                     duration_ms=_ms(start)
                 )
 
+            # Sort by score descending, take best
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            best_score, best_url, best_text = candidates[0]
+
             return ToolResult(
-                success=False,
-                message="No suitable result URL found on page",
-                error="NoResults",
-                data={"current_url": self._page.url},
+                success=True,
+                message=f"Best result: '{best_text[:60]}'",
+                data={
+                    "url":         best_url,
+                    "title":       best_text,
+                    "score":       best_score,
+                    "current_url": self._page.url,
+                },
                 duration_ms=_ms(start)
             )
 
@@ -1153,7 +1165,6 @@ class BrowserTools:
                 data={},
                 duration_ms=_ms(start)
             )
-        
 
     def search_and_extract(
         self,
@@ -1173,7 +1184,7 @@ class BrowserTools:
                 return search_result
 
             # Step 2 — get first result URL
-            url_result = self.get_first_result_url()
+            url_result = self.get_first_result_url(query=query)
             if not url_result.success:
                 # Fall back to extracting search results page
                 return self.extract_page_text()
