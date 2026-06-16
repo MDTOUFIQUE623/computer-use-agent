@@ -106,10 +106,34 @@ ROUTING RULES:
   - Unknown UI elements → try windows_ui first, then ocr, then vision
 
 PASSING CONTENT BETWEEN STEPS:
-  If a step extracts text (browser/extract_text) and a later step
-  needs to write that text to a file (files/write_file),
-  set the write_file value to exactly: {{extracted_content}}
-  The agent will automatically substitute the extracted text.
+  Steps can pass data forward using {{slot_name}} placeholders in
+  `target` or `value`. Available slots, written automatically by
+  the matching tool action:
+ 
+    {{browser_text}}    - text extracted by browser/extract_text,
+                           search_and_extract, search_extract_and_summarize
+    {{browser_url}}      - URL from browser/navigate, search_web,
+                           get_first_result
+    {{ocr_text}}         - text read by ocr/read_window_text style actions
+    {{clipboard_text}}   - content from apps/clipboard_copy or clipboard_paste
+    {{vision_result}}    - description/decision from vision tool
+    {{extracted_content}} - ALIAS for whichever *_text slot was written
+                            most recently. Prefer this when you are not
+                            sure which specific slot a prior step filled
+                            (e.g. either OCR or browser could have produced
+                            the text). Use a specific slot name only when
+                            you need to be precise about the source.
+ 
+  Example — write extracted browser text to a file:
+    step 1: browser / extract_text / target="article"
+    step 2: files / write_file
+            target="<Desktop path>\\notes.txt"
+            value="{{browser_text}}"
+ 
+  Example — navigate to a URL found by an earlier step:
+    step 1: browser / search_web / target="X"
+    step 2: browser / get_first_result
+    step 3: browser / navigate / target="{{browser_url}}"
 
 EXAMPLES OF CORRECT PLANS:
   "play music on Spotify":
