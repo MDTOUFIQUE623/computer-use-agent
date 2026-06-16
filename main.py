@@ -8,6 +8,7 @@ src_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
 sys.path.append(src_path)
 
 from src.graph import app
+from src.state import StateSlots
 
 # Configure logging
 logging.basicConfig(
@@ -23,7 +24,7 @@ def main():
         sys.exit(1)
 
     print("\n" + "="*50)
-    print("    Computer Use Agent v2")
+    print("    Computer Use Agent v3")
     print("="*50)
 
     task = input("\nWhat do you want me to do? ").strip()
@@ -46,7 +47,7 @@ def main():
         "task_start_ms":      None,
         "_last_tool_result":  None,
         "_last_step_result":  None,
-        "extracted_content":  None,   # adding the extracted content for browser automation
+        "slots":              StateSlots(),   # Phase 1: typed cross-step state
     }
 
     try:
