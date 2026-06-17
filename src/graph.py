@@ -9,6 +9,7 @@ from langgraph.graph import StateGraph, START, END
 from src.brain import Brain
 from src.verifier import verify_step
 from src.state import StateSlots, resolve_placeholder, describe_slots
+from src.registry import get_registry, ExecutionContext
 from src.models import (
     Plan,
     Step,
@@ -52,288 +53,18 @@ class GraphState(TypedDict):
     _last_tool_result:  Optional[ToolResult]
     _last_step_result:  Optional[StepResult]
  
-    # Typed cross-step state (replaces v2's single extracted_content str)
+    # Typed cross-step state (Phase 1)
     slots: StateSlots
- 
-# Tool executors - one function per tool type
- 
-def _execute_files(step: Step) -> ToolResult:
-    from src.tools.files import FileTools
-    import os
- 
-    ft = FileTools()
- 
-    # Resolve Desktop/Documents/Downloads properly and fix wrong user paths
-    def resolve_path(path: str) -> str:
-        import os
-        import re
- 
-        # Fix wrong user paths — Gemini sometimes generates \Default\ or \User\
-        if "\\Default\\" in path or "/Default/" in path:
-            actual_user = os.path.expanduser("~")
-            # Replace the wrong user segment
-            path = re.sub(
-                r'C:\\Users\\[^\\]+\\',
-                actual_user.rstrip("\\") + "\\",
-                path
-            )
- 
-        # Resolve shorthand names
-        home = os.path.expanduser("~")
-        lower = path.lower().strip()
- 
-        if lower == "desktop":
-            onedrive = os.path.join(home, "OneDrive", "Desktop")
-            regular = os.path.join(home, "Desktop")
-            return onedrive if os.path.exists(onedrive) else regular
- 
-        if lower == "downloads":
-            return os.path.join(home, "Downloads")
- 
-        if lower == "documents":
-            onedrive = os.path.join(home, "OneDrive", "Documents")
-            regular = os.path.join(home, "Documents")
-            return onedrive if os.path.exists(onedrive) else regular
- 
-        if lower == "pictures":
-            onedrive = os.path.join(home, "OneDrive", "Pictures")
-            regular = os.path.join(home, "Pictures")
-            return onedrive if os.path.exists(onedrive) else regular
- 
-        # If path starts with C:\Users\ but has wrong username
-        if path.startswith("C:\\Users\\"):
-            parts = path.split("\\")
-            if len(parts) > 2 and parts[2] != os.path.basename(home):
-                parts[2] = os.path.basename(home)
-                path = "\\".join(parts)
- 
-        return path
- 
-    target = resolve_path(step.target)
-    value = step.value or ""
- 
-    action_map = {
-        ActionType.MOVE_FILE: lambda: ft.move_file(
-            target, resolve_path(value)
-        ),
-        ActionType.COPY_FILE: lambda: ft.copy_file(
-            target, resolve_path(value)
-        ),
-        ActionType.RENAME_FILE: lambda: ft.rename_file(
-            target, value
-        ),
-        ActionType.DELETE_FILE: lambda: ft.delete_file(target),
-        ActionType.CREATE_FOLDER: lambda: ft.create_folder(
-            os.path.join(target, value) if value else target
-        ),
-        ActionType.LIST_FILES: lambda: ft.list_files(target),
-        ActionType.FIND_FILES: lambda: ft.find_files(
-            target, value or "*"
-        ),
-        ActionType.ORGANIZE_FILES: lambda: ft.organize_by_type(target),
-        ActionType.WRITE_FILE: lambda: ft.write_file(
-            target,
-            value or ""
-        ),
-    }
- 
-    handler = action_map.get(step.action)
-    if handler is None:
-        return ToolResult(
-            success=False,
-            message=f"Unknown files action: {step.action.value}",
-            error="UnknownAction",
-            data={}
-        )
- 
-    return handler()
- 
- 
-def _execute_windows_ui(step: Step) -> ToolResult:
-    from src.tools.windows_ui import WindowsUITools
-    ui = WindowsUITools()
- 
-    action_map = {
-        ActionType.OPEN_APP:   lambda: ui.open_app(step.target),
-        ActionType.CLOSE_APP:  lambda: ui.close_app(step.target),
-        ActionType.FOCUS_APP:  lambda: ui.focus_app(step.target),
-        ActionType.CLICK:      lambda: ui.click_element_by_name(
-            step.target, control_type=None
-        ),
-        ActionType.TYPE_TEXT:  lambda: ui.type_into_focused(step.value or ""),
-        ActionType.PRESS_KEY:  lambda: ui.press_key(step.target),
-        ActionType.SCROLL:     lambda: ui.scroll_in_app(
-            step.target,
-            direction=step.value or "down"
-        ),
-        ActionType.SELECT:     lambda: ui.click_element_by_name(
-            step.target, control_type="ListItem"
-        ),
-        ActionType.PRESS_KEY: lambda: ui.press_key(
-            step.value or step.target  # key is in value, target is the app
-        ),
-    }
- 
-    handler = action_map.get(step.action)
-    if handler is None:
-        return ToolResult(
-            success=False,
-            message=f"Unknown windows_ui action: {step.action.value}",
-            error="UnknownAction",
-            data={}
-        )
-    return handler()
- 
- 
-def _execute_browser(step: Step, state: GraphState) -> ToolResult:
-    bt = _get_browser_instance()
- 
-    # Resolve {{slot_name}} placeholders (e.g. {{browser_url}},
-    # {{extracted_content}}) in target. Falls back to the raw target
-    # string if it isn't a placeholder or the slot is empty.
-    target = resolve_placeholder(step.target, state["slots"])
- 
-    action_map = {
-        ActionType.NAVIGATE:          lambda: bt.navigate(target),
-        ActionType.SEARCH_WEB:        lambda: bt.search_web(target),
-        ActionType.CLICK_ELEMENT:     lambda: bt.click_element(text=target),
-        ActionType.FILL_FORM:         lambda: bt.fill_field(
-            target, step.value or ""
-        ),
-        ActionType.EXTRACT_TEXT:      lambda: bt.extract_page_text(
-            selector=target
-            if target not in ("body", "page", "all")
-            else None
-        ),
-        ActionType.SEARCH_AND_EXTRACT: lambda: bt.search_and_extract(
-            target
-        ),
-        ActionType.SEARCH_EXTRACT_AND_SUMMARIZE: lambda: bt.search_extract_and_summarize(
-            target, step.value
-        ),
-        ActionType.WAIT_FOR_PAGE:     lambda: bt.wait_for_text(target),
-        ActionType.GET_FIRST_RESULT:  lambda: bt.get_first_result_url(),
-    }
- 
-    handler = action_map.get(step.action)
-    if handler is None:
-        return ToolResult(
-            success=False,
-            message=f"Unknown browser action: {step.action.value}",
-            error="UnknownAction",
-            data={}
-        )
-    return handler()
- 
- 
-def _execute_apps(step: Step) -> ToolResult:
-    from src.tools.apps import SpotifyTools, NotionTools, SystemTools
- 
-    spotify = SpotifyTools()
-    system  = SystemTools()
-    notion  = NotionTools()
- 
-    action_map = {
-        ActionType.SPOTIFY_PLAY:     lambda: spotify.play(),
-        ActionType.SPOTIFY_PAUSE:    lambda: spotify.pause(),
-        ActionType.SPOTIFY_NEXT:     lambda: spotify.next_track(),
-        ActionType.SPOTIFY_PLAYLIST: lambda: spotify.open_playlist_by_name(
-            step.target
-        ),
-        ActionType.CLIPBOARD_COPY:   lambda: system.copy_to_clipboard(
-            step.value or step.target
-        ),
-        ActionType.CLIPBOARD_PASTE:  lambda: system.get_clipboard(),
-        ActionType.VOLUME_SET:       lambda: system.set_system_volume(
-            int(step.value or "50")
-        ),
-        ActionType.WAIT:             lambda: system.wait_seconds(
-            float(step.value or "1")
-        ),
-        ActionType.NOTION_CREATE:    lambda: notion.create_page(
-            parent_page_id=step.target,
-            title=step.value or "New Page",
-        ),
-        ActionType.NOTION_APPEND:    lambda: notion.append_text(
-            page_id=step.target,
-            text=step.value or "",
-        ),
-    }
- 
-    handler = action_map.get(step.action)
-    if handler is None:
-        return ToolResult(
-            success=False,
-            message=f"Unknown apps action: {step.action.value}",
-            error="UnknownAction",
-            data={}
-        )
-    return handler()
- 
- 
-def _execute_ocr(step: Step) -> ToolResult:
-    from src.tools.ocr import OCRTools
-    import pyautogui
- 
-    ocr = OCRTools()
- 
-    if step.action == ActionType.CLICK:
-        # step.target is the text to find on screen
-        # step.value is the app window to search in (optional)
-        if step.value:
-            # Search in specific window
-            result = ocr.find_text_in_window(step.value, step.target)
-        else:
-            # Search full screen
-            result = ocr.find_text_on_screen(step.target)
- 
-        if result.success:
-            pyautogui.click(
-                result.data["center_x"],
-                result.data["center_y"]
-            )
-        return result
- 
-    if step.action == ActionType.TYPE_TEXT:
-        pyautogui.write(step.value or step.target, interval=0.05)
-        return ToolResult(
-            success=True,
-            message=f"Typed via OCR fallback",
-            data={"field_value": step.value or step.target}
-        )
- 
-    return ToolResult(
-        success=False,
-        message=f"Unknown OCR action: {step.action.value}",
-        error="UnknownAction",
-        data={}
-    )
- 
- 
-def _execute_vision(step: Step, brain: Brain) -> ToolResult:
-    from src.tools.vision import VisionTools
-    from google import genai
- 
-    client = genai.Client()
-    vt     = VisionTools(client)
- 
-    result = vt.decide_action(
-        task_step      = step.description,
-        app_name       = step.target,
-        prior_attempts = [f"Primary tool {step.tool.value} failed"],
-    )
- 
-    if result.success and result.data.get("coordinates"):
-        import pyautogui
-        coords = result.data["coordinates"]
-        pyautogui.click(coords["x"], coords["y"])
- 
-    return result
  
  
 # ---------------------------------------------------------------------------
 # Browser instance management
 # ---------------------------------------------------------------------------
+# Kept in graph.py rather than moved into the browser tool module — this
+# is task-level lifecycle (one browser per task, closed at the end),
+# not per-step dispatch, so it doesn't belong inside a per-step executor.
+# src/tools/browser.py's build_executor() calls _get_browser_instance()
+# from here.
  
 _browser_instance = None
  
@@ -360,27 +91,21 @@ def _close_browser_instance():
  
  
 # ---------------------------------------------------------------------------
-# Route to correct executor
+# Route to correct executor (Phase 2: registry lookup instead of if/elif)
 # ---------------------------------------------------------------------------
  
 def _execute_step(step: Step, brain: Brain, state: GraphState) -> ToolResult:
     """
-    Route a step to the correct tool executor.
-    Resolves {{slot_name}} placeholders (including the {{extracted_content}}
-    alias) in step.value before dispatch. step.target placeholder
-    resolution for browser steps happens inside _execute_browser since
-    that's currently the only tool whose target commonly references a
-    prior slot (e.g. navigating to {{browser_url}}); other tools mostly
-    use value for substituted content.
+    Resolve any {{slot_name}} placeholder in step.value, then dispatch
+    to whichever tool is registered for step.tool via the registry built
+    in src/registry.py. Unknown/unregistered tools and executor crashes
+    both return a ToolResult rather than raising, matching v2 behavior.
     """
     resolved_step = step
  
     if step.value and step.value.startswith("{{") and step.value.endswith("}}"):
         resolved_value = resolve_placeholder(step.value, state["slots"])
  
-        # If resolve_placeholder returned the placeholder unchanged, the
-        # slot was empty/unknown — that's a hard failure for steps that
-        # need real content (e.g. write_file).
         if resolved_value == step.value:
             return ToolResult(
                 success=False,
@@ -389,7 +114,6 @@ def _execute_step(step: Step, brain: Brain, state: GraphState) -> ToolResult:
                 data={}
             )
  
-        # Truncate to a reasonable file size, same cap as v2 had
         if isinstance(resolved_value, str):
             resolved_value = resolved_value[:10000]
  
@@ -405,32 +129,25 @@ def _execute_step(step: Step, brain: Brain, state: GraphState) -> ToolResult:
             requires_verification = step.requires_verification,
         )
  
-    tool = resolved_step.tool
+    registry = get_registry()
+    executor = registry.get_executor(resolved_step.tool)
+ 
+    if executor is None:
+        return ToolResult(
+            success=False,
+            message=f"No executor registered for tool: {resolved_step.tool.value}",
+            error="UnknownTool",
+            data={}
+        )
+ 
+    ctx = ExecutionContext(slots=state["slots"], brain=brain)
  
     try:
-        if tool == ToolType.FILES:
-            return _execute_files(resolved_step)
-        elif tool == ToolType.WINDOWS_UI:
-            return _execute_windows_ui(resolved_step)
-        elif tool == ToolType.BROWSER:
-            return _execute_browser(resolved_step, state)
-        elif tool == ToolType.APPS:
-            return _execute_apps(resolved_step)
-        elif tool == ToolType.OCR:
-            return _execute_ocr(resolved_step)
-        elif tool == ToolType.VISION:
-            return _execute_vision(resolved_step, brain)
-    
-        else:
-            return ToolResult(
-                success=False,
-                message=f"No executor for tool: {tool.value}",
-                error="UnknownTool",
-                data={}
-            )
- 
+        return executor(resolved_step, ctx)
     except Exception as e:
-        log.error("Executor crashed for tool=%s: %s", tool.value, e)
+        log.error(
+            "Executor crashed for tool=%s: %s", resolved_step.tool.value, e
+        )
         return ToolResult(
             success=False,
             message=f"Executor crashed: {e}",
@@ -535,11 +252,8 @@ def execute_node(state: GraphState) -> dict:
     if tool_result.error:
         print(f"[EXEC] Error: {tool_result.error}")
  
-    # Capture output into the correct typed slot based on tool + action,
-    # rather than one shared `extracted` string. This is the core Phase 1
-    # change: each output type gets its own home so a later step can
-    # reference it precisely (e.g. {{browser_url}} vs {{ocr_text}}) while
-    # {{extracted_content}} / last_text still works as a generic fallback.
+    # Capture output into the correct typed slot based on tool + action
+    # (Phase 1 logic, unchanged).
     slots = state["slots"]
  
     if tool_result.success and tool_result.data:
@@ -555,9 +269,6 @@ def execute_node(state: GraphState) -> dict:
                 print(f"[EXEC] Extracted {len(text.split())} words (cleaned)")
             if url:
                 slots.browser_url = url
-                # A bare URL is also reasonable "last_text" content if
-                # nothing else has been captured yet (e.g. get_first_result
-                # feeding straight into navigate).
                 if not text:
                     slots.last_text = url
                 print(f"[EXEC] URL: {url}")
@@ -652,7 +363,6 @@ def verify_node(state: GraphState) -> dict:
             "_last_step_result": step_result,
         }
  
-    # Success or uncertain — advance to next step
     return {
         "step_results":       new_results,
         "current_step_index": index + 1,
@@ -670,7 +380,6 @@ def retry_node(state: GraphState) -> dict:
  
     print(f"[RETRY] Attempt {retry_count} for step {step.step_number}")
  
-    # Too many retries
     if retry_count > MAX_RETRIES_PER_STEP:
         brain = Brain()
         brain.record_step_failure(
@@ -682,9 +391,6 @@ def retry_node(state: GraphState) -> dict:
             reason = state.get("last_error", "unknown"),
         )
  
-        # Check if this is the LAST step and core work is done
-        # If we have extracted content or completed most steps,
-        # skip this step rather than failing the whole task
         is_last_step = index >= len(plan.steps) - 1
         steps_completed = len(state.get("step_results", []))
         majority_done = steps_completed >= (len(plan.steps) - 1)
@@ -696,7 +402,7 @@ def retry_node(state: GraphState) -> dict:
             )
             return {
                 "retry_count":        retry_count,
-                "current_step_index": index + 1,  # advance past failed step
+                "current_step_index": index + 1,
                 "last_error":         None,
             }
  
@@ -715,7 +421,6 @@ def retry_node(state: GraphState) -> dict:
             ),
         }
  
-    # Retry 1 — try fallback tool
     if retry_count == 1 and step.fallback_tool:
         print(
             f"[RETRY] Trying fallback tool: "
@@ -747,7 +452,6 @@ def retry_node(state: GraphState) -> dict:
             "retry_count": retry_count,
         }
  
-    # Retry 2 — ask Brain to replan
     print(f"[RETRY] Asking Brain to replan step {step.step_number}")
     brain    = Brain()
     new_step = brain.replan_step(
@@ -776,7 +480,6 @@ def retry_node(state: GraphState) -> dict:
             "retry_count": retry_count,
         }
  
-    # No replan — skip if majority of work is done
     steps_completed = len(state.get("step_results", []))
     majority_done   = steps_completed >= (len(plan.steps) - 1)
  
@@ -813,7 +516,6 @@ def complete_node(state: GraphState) -> dict:
     print(f"  Steps executed: {len(results)}/{plan.total_steps}")
     print(f"  Total time:     {elapsed}ms")
  
-    # Show final slot state (replaces v2's single extracted_content dump)
     slots = state.get("slots")
     if slots:
         print(f"\n{'='*50}")
@@ -821,7 +523,6 @@ def complete_node(state: GraphState) -> dict:
         print(f"{'='*50}")
         print(describe_slots(slots))
  
-        # Preserve v2's behavior of printing the main text result in full
         if slots.last_text:
             preview = slots.last_text[:2000]
             print(f"\n{preview}")
@@ -885,7 +586,6 @@ def after_verify(state: GraphState) -> str:
     if last_result and last_result.status == VerificationStatus.FAILED:
         return "retry"
  
-    # Check if all steps are done
     plan  = state.get("plan")
     index = state.get("current_step_index", 0)
     if plan and index >= len(plan.steps):
@@ -916,7 +616,6 @@ def build_graph():
     """Construct and compile the LangGraph workflow."""
     workflow = StateGraph(GraphState)
  
-    # Add nodes
     workflow.add_node("plan",     plan_node)
     workflow.add_node("route",    route_node)
     workflow.add_node("execute",  execute_node)
@@ -925,10 +624,8 @@ def build_graph():
     workflow.add_node("complete", complete_node)
     workflow.add_node("failed",   failed_node)
  
-    # Entry point
     workflow.add_edge(START, "plan")
  
-    # Conditional edges
     workflow.add_conditional_edges(
         "plan",
         after_plan,
@@ -960,13 +657,10 @@ def build_graph():
         {"execute": "execute", "failed": "failed"}
     )
  
-    # Terminal nodes go to END
     workflow.add_edge("complete", END)
     workflow.add_edge("failed",   END)
  
     return workflow.compile()
- 
- 
  
  
 # Compiled graph — imported by main.py

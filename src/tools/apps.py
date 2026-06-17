@@ -1185,3 +1185,55 @@ class SystemTools:
 
 def _ms(start: float) -> int:
     return int((time.monotonic() - start) * 1000)
+
+
+
+def build_executor():
+    """Build the ToolSpec for the `apps` tool."""
+    from src.models import ActionType, ToolResult, ToolType as _ToolType
+    from src.registry import ToolSpec
+ 
+    def executor(step, ctx) -> "ToolResult":
+        spotify = SpotifyTools()
+        system  = SystemTools()
+        notion  = NotionTools()
+ 
+        action_map = {
+            ActionType.SPOTIFY_PLAY:     lambda: spotify.play(),
+            ActionType.SPOTIFY_PAUSE:    lambda: spotify.pause(),
+            ActionType.SPOTIFY_NEXT:     lambda: spotify.next_track(),
+            ActionType.SPOTIFY_PLAYLIST: lambda: spotify.open_playlist_by_name(
+                step.target
+            ),
+            ActionType.CLIPBOARD_COPY:   lambda: system.copy_to_clipboard(
+                step.value or step.target
+            ),
+            ActionType.CLIPBOARD_PASTE:  lambda: system.get_clipboard(),
+            ActionType.VOLUME_SET:       lambda: system.set_system_volume(
+                int(step.value or "50")
+            ),
+            ActionType.WAIT:             lambda: system.wait_seconds(
+                float(step.value or "1")
+            ),
+            ActionType.NOTION_CREATE:    lambda: notion.create_page(
+                parent_page_id=step.target,
+                title=step.value or "New Page",
+            ),
+            ActionType.NOTION_APPEND:    lambda: notion.append_text(
+                page_id=step.target,
+                text=step.value or "",
+            ),
+        }
+ 
+        handler = action_map.get(step.action)
+        if handler is None:
+            return ToolResult(
+                success=False,
+                message=f"Unknown apps action: {step.action.value}",
+                error="UnknownAction",
+                data={}
+            )
+        return handler()
+ 
+    return ToolSpec(tool_type=_ToolType.APPS, executor=executor)
+ 

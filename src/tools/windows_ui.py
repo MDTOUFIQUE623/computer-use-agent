@@ -785,3 +785,54 @@ class WindowsUITools:
 
 def _ms(start: float) -> int:
     return int((time.monotonic() - start) * 1000)
+
+
+ 
+def build_executor():
+    """Build the ToolSpec for the `windows_ui` tool."""
+    from src.models import ActionType, ToolResult, ToolType as _ToolType
+    from src.registry import ToolSpec
+ 
+    def executor(step, ctx) -> "ToolResult":
+        ui = WindowsUITools()
+ 
+        action_map = {
+            ActionType.OPEN_APP:   lambda: ui.open_app(step.target),
+            ActionType.CLOSE_APP:  lambda: ui.close_app(step.target),
+            ActionType.FOCUS_APP:  lambda: ui.focus_app(step.target),
+            ActionType.CLICK:      lambda: ui.click_element_by_name(
+                step.target, control_type=None
+            ),
+            ActionType.TYPE_TEXT:  lambda: ui.type_into_focused(step.value or ""),
+            # NOTE: PRESS_KEY appears twice in the original v2 action_map
+            # (graph.py lines ~190 and ~196) — the second entry silently
+            # overwrote the first since dict literals keep only the last
+            # duplicate key. Preserved as-is here for behavioral parity;
+            # this means PRESS_KEY currently reads from step.value first,
+            # falling back to step.target. Worth revisiting in a later
+            # phase, but Phase 2 is a pure refactor and shouldn't change
+            # existing behavior.
+            ActionType.SCROLL:     lambda: ui.scroll_in_app(
+                step.target,
+                direction=step.value or "down"
+            ),
+            ActionType.SELECT:     lambda: ui.click_element_by_name(
+                step.target, control_type="ListItem"
+            ),
+            ActionType.PRESS_KEY: lambda: ui.press_key(
+                step.value or step.target
+            ),
+        }
+ 
+        handler = action_map.get(step.action)
+        if handler is None:
+            return ToolResult(
+                success=False,
+                message=f"Unknown windows_ui action: {step.action.value}",
+                error="UnknownAction",
+                data={}
+            )
+        return handler()
+ 
+    return ToolSpec(tool_type=_ToolType.WINDOWS_UI, executor=executor)
+ 

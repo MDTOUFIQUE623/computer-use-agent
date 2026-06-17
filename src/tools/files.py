@@ -545,3 +545,110 @@ class FileTools:
 def _ms(start: float) -> int:
     """Elapsed milliseconds since start."""
     return int((time.monotonic() - start) * 1000)
+
+
+ 
+# ---------------------------------------------------------------------------
+# Phase 2 — registry adapter
+# ---------------------------------------------------------------------------
+# Everything above this line is unchanged from v2. The function below is
+# the only new code — it's what src/registry.py calls to wire this module
+# into the tool dispatch table.
+ 
+def build_executor():
+    """
+    Build the ToolSpec for the `files` tool.
+ 
+    This wraps the existing action_map dispatch logic that used to live
+    inline inside graph.py's _execute_files(). The path-resolution
+    helper (resolve_path) and the action_map itself are unchanged from
+    v2 — only their location moved, from graph.py into this module,
+    since the registry pattern means each tool owns its own action
+    dispatch instead of graph.py knowing about every tool's internals.
+    """
+    import os
+    import re
+    from src.models import ActionType, ToolResult
+    from src.registry import ToolSpec
+    from src.models import ToolType as _ToolType
+ 
+    def resolve_path(path: str) -> str:
+        # Fix wrong user paths — Gemini sometimes generates \Default\ or \User\
+        if "\\Default\\" in path or "/Default/" in path:
+            actual_user = os.path.expanduser("~")
+            path = re.sub(
+                r'C:\\Users\\[^\\]+\\',
+                actual_user.rstrip("\\") + "\\",
+                path
+            )
+ 
+        home = os.path.expanduser("~")
+        lower = path.lower().strip()
+ 
+        if lower == "desktop":
+            onedrive = os.path.join(home, "OneDrive", "Desktop")
+            regular = os.path.join(home, "Desktop")
+            return onedrive if os.path.exists(onedrive) else regular
+ 
+        if lower == "downloads":
+            return os.path.join(home, "Downloads")
+ 
+        if lower == "documents":
+            onedrive = os.path.join(home, "OneDrive", "Documents")
+            regular = os.path.join(home, "Documents")
+            return onedrive if os.path.exists(onedrive) else regular
+ 
+        if lower == "pictures":
+            onedrive = os.path.join(home, "OneDrive", "Pictures")
+            regular = os.path.join(home, "Pictures")
+            return onedrive if os.path.exists(onedrive) else regular
+ 
+        if path.startswith("C:\\Users\\"):
+            parts = path.split("\\")
+            if len(parts) > 2 and parts[2] != os.path.basename(home):
+                parts[2] = os.path.basename(home)
+                path = "\\".join(parts)
+ 
+        return path
+ 
+    def executor(step, ctx) -> "ToolResult":
+        ft = FileTools()
+        target = resolve_path(step.target)
+        value  = step.value or ""
+ 
+        action_map = {
+            ActionType.MOVE_FILE: lambda: ft.move_file(
+                target, resolve_path(value)
+            ),
+            ActionType.COPY_FILE: lambda: ft.copy_file(
+                target, resolve_path(value)
+            ),
+            ActionType.RENAME_FILE: lambda: ft.rename_file(
+                target, value
+            ),
+            ActionType.DELETE_FILE: lambda: ft.delete_file(target),
+            ActionType.CREATE_FOLDER: lambda: ft.create_folder(
+                os.path.join(target, value) if value else target
+            ),
+            ActionType.LIST_FILES: lambda: ft.list_files(target),
+            ActionType.FIND_FILES: lambda: ft.find_files(
+                target, value or "*"
+            ),
+            ActionType.ORGANIZE_FILES: lambda: ft.organize_by_type(target),
+            ActionType.WRITE_FILE: lambda: ft.write_file(
+                target, value or ""
+            ),
+        }
+ 
+        handler = action_map.get(step.action)
+        if handler is None:
+            return ToolResult(
+                success=False,
+                message=f"Unknown files action: {step.action.value}",
+                error="UnknownAction",
+                data={}
+            )
+ 
+        return handler()
+ 
+    return ToolSpec(tool_type=_ToolType.FILES, executor=executor)

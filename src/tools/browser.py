@@ -1401,3 +1401,60 @@ def _clean_web_text(text: str) -> str:
             cleaned_lines.append(line)
 
         return "\n".join(cleaned_lines).strip()
+
+
+
+
+def build_executor():
+    """Build the ToolSpec for the `browser` tool."""
+    from src.models import ActionType, ToolResult, ToolType as _ToolType
+    from src.registry import ToolSpec
+    from src.state import resolve_placeholder
+ 
+    def executor(step, ctx) -> "ToolResult":
+        # graph.py owns the persistent browser instance across the whole
+        # task (started once, closed once at complete/failed). Import
+        # locally to avoid a circular import at module load time.
+        from src.graph import _get_browser_instance
+        bt = _get_browser_instance()
+ 
+        # Resolve {{slot_name}} placeholders (e.g. {{browser_url}},
+        # {{extracted_content}}) in target.
+        target = step.target
+        if ctx.slots is not None:
+            target = resolve_placeholder(step.target, ctx.slots)
+ 
+        action_map = {
+            ActionType.NAVIGATE:          lambda: bt.navigate(target),
+            ActionType.SEARCH_WEB:        lambda: bt.search_web(target),
+            ActionType.CLICK_ELEMENT:     lambda: bt.click_element(text=target),
+            ActionType.FILL_FORM:         lambda: bt.fill_field(
+                target, step.value or ""
+            ),
+            ActionType.EXTRACT_TEXT:      lambda: bt.extract_page_text(
+                selector=target
+                if target not in ("body", "page", "all")
+                else None
+            ),
+            ActionType.SEARCH_AND_EXTRACT: lambda: bt.search_and_extract(
+                target
+            ),
+            ActionType.SEARCH_EXTRACT_AND_SUMMARIZE: lambda: bt.search_extract_and_summarize(
+                target, step.value
+            ),
+            ActionType.WAIT_FOR_PAGE:     lambda: bt.wait_for_text(target),
+            ActionType.GET_FIRST_RESULT:  lambda: bt.get_first_result_url(),
+        }
+ 
+        handler = action_map.get(step.action)
+        if handler is None:
+            return ToolResult(
+                success=False,
+                message=f"Unknown browser action: {step.action.value}",
+                error="UnknownAction",
+                data={}
+            )
+        return handler()
+ 
+    return ToolSpec(tool_type=_ToolType.BROWSER, executor=executor)
+ 

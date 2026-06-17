@@ -678,3 +678,32 @@ def _build_vision_decision(data: dict) -> VisionDecision:
 def _ms(start: float) -> int:
     return int((time.monotonic() - start) * 1000)
 
+
+
+ 
+def build_executor():
+    """Build the ToolSpec for the `vision` tool."""
+    from src.models import ToolResult, ToolType as _ToolType
+    from src.registry import ToolSpec
+ 
+    def executor(step, ctx) -> "ToolResult":
+        from google import genai
+ 
+        client = genai.Client()
+        vt     = VisionTools(client)
+ 
+        result = vt.decide_action(
+            task_step      = step.description,
+            app_name       = step.target,
+            prior_attempts = [f"Primary tool {step.tool.value} failed"],
+        )
+ 
+        if result.success and result.data.get("coordinates"):
+            import pyautogui
+            coords = result.data["coordinates"]
+            pyautogui.click(coords["x"], coords["y"])
+ 
+        return result
+ 
+    return ToolSpec(tool_type=_ToolType.VISION, executor=executor)
+ 

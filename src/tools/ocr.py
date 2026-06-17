@@ -670,3 +670,49 @@ def _word_to_dict(word: WordData) -> dict:
 
 def _ms(start: float) -> int:
     return int((time.monotonic() - start) * 1000)
+
+
+
+
+ 
+def build_executor():
+    """Build the ToolSpec for the `ocr` tool."""
+    from src.models import ActionType, ToolResult, ToolType as _ToolType
+    from src.registry import ToolSpec
+ 
+    def executor(step, ctx) -> "ToolResult":
+        import pyautogui
+ 
+        ocr = OCRTools()
+ 
+        if step.action == ActionType.CLICK:
+            # step.target is the text to find on screen
+            # step.value is the app window to search in (optional)
+            if step.value:
+                result = ocr.find_text_in_window(step.value, step.target)
+            else:
+                result = ocr.find_text_on_screen(step.target)
+ 
+            if result.success:
+                pyautogui.click(
+                    result.data["center_x"],
+                    result.data["center_y"]
+                )
+            return result
+ 
+        if step.action == ActionType.TYPE_TEXT:
+            pyautogui.write(step.value or step.target, interval=0.05)
+            return ToolResult(
+                success=True,
+                message=f"Typed via OCR fallback",
+                data={"field_value": step.value or step.target}
+            )
+ 
+        return ToolResult(
+            success=False,
+            message=f"Unknown OCR action: {step.action.value}",
+            error="UnknownAction",
+            data={}
+        )
+ 
+    return ToolSpec(tool_type=_ToolType.OCR, executor=executor)
