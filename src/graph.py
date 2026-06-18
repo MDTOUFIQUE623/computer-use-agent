@@ -261,8 +261,24 @@ def execute_node(state: GraphState) -> dict:
  
         if step.tool == ToolType.BROWSER:
             text = data.get("text")
-            url  = data.get("current_url") or data.get("url")
             title = data.get("page_title")
+ 
+            # BUGFIX (Phase 2.5b): get_first_result_url() returns BOTH
+            # "url" (the specific result link it found and scored) and
+            # "current_url" (the search results page we're still
+            # physically on, which is also always non-empty). The old
+            # priority `current_url or url` meant "url" was dead code —
+            # the actual found link was discarded every time in favor of
+            # the search page we hadn't navigated away from yet, which
+            # caused a later {{browser_url}} navigate to just reload the
+            # search results instead of going to the real target.
+            #
+            # "url" represents a deliberately-found target (get_first_result,
+            # and any future action that searches/scores candidate links)
+            # and should win whenever present. "current_url" is the
+            # fallback for actions that only ever report where we
+            # currently are (navigate, search_web).
+            url = data.get("url") or data.get("current_url")
  
             if text:
                 slots.set_text("browser_text", text)
@@ -595,10 +611,28 @@ def after_verify(state: GraphState) -> str:
  
  
 def after_retry(state: GraphState) -> str:
-    """After retry_node — re-execute or fail."""
+    """
+    After retry_node — route back through route_node, or fail.
+ 
+    BUGFIX (Phase 2.5a): this used to return "execute" directly, which
+    skipped route_node's bounds check (`index >= len(plan.steps)`).
+    When retry_node's "skip optional step" branch advances
+    current_step_index past the last step (e.g. the failing step was
+    the last step in the plan), going straight to execute_node caused
+    `plan.steps[index]` to raise IndexError: list index out of range,
+    crashing the whole task instead of completing it.
+ 
+    Routing through "route" first means route_node's existing bounds
+    check catches this case and correctly sets is_done=True, exactly
+    as if all steps had legitimately completed. The same-step retry
+    paths (fallback_tool branch, replan branch — which don't change
+    current_step_index) still end up back at execute_node via route's
+    should_execute edge, so behavior for those paths is unchanged
+    except for one extra (cheap, side-effect-free) hop through route_node.
+    """
     if state.get("is_failed"):
         return "failed"
-    return "execute"
+    return "route"
  
  
 def after_plan(state: GraphState) -> str:
@@ -654,7 +688,7 @@ def build_graph():
     workflow.add_conditional_edges(
         "retry",
         after_retry,
-        {"execute": "execute", "failed": "failed"}
+        {"route": "route", "execute": "execute", "failed": "failed"}
     )
  
     workflow.add_edge("complete", END)

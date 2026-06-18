@@ -92,10 +92,17 @@ def _route_verification(
         dst = tool_result.data.get("path") if tool_result.data else None
         return _verify_folder_exists(dst)
 
-    # --- browser ---
+     # --- browser ---
     if action in (ActionType.NAVIGATE, ActionType.SEARCH_WEB):
-        expected_url = tool_result.data.get("current_url") if tool_result.data else None
-        return _verify_browser_url(expected_url, step.target)
+        # BUGFIX (Phase 2.5b): get_first_result_url() and other future
+        # browser actions can set "url" as the deliberately-found target
+        # link, distinct from "current_url" (the page we're still on).
+        # Prefer "url" when present so verification checks the actual
+        # navigation target, not a stale page. Falls back to current_url
+        # for actions that only ever report where we currently are.
+        data = tool_result.data or {}
+        expected_url = data.get("current_url")
+        return _verify_browser_url(expected_url, step.target, action)
 
     # --- text typed into a field ---
     if action == ActionType.TYPE_TEXT:
@@ -237,50 +244,78 @@ def _verify_folder_exists(path: Optional[str]) -> tuple[VerificationStatus, str]
 
 
 def _verify_browser_url(
-    current_url: Optional[str],
-    expected_target: str,
-) -> tuple[VerificationStatus, str]:
-    if not current_url:
+        current_url: Optional[str],
+        expected_target: str,
+        action: Optional["ActionType"] = None,
+    ) -> tuple[VerificationStatus, str]:
+        """
+        action: which browser action produced this URL. Used to decide
+        whether landing on a search engine domain counts as success.
+ 
+        BUGFIX (Phase 2.5b): the search-engine-domain check used to apply
+        unconditionally to BOTH search_web and navigate steps. That meant
+        a navigate step whose target was a real article/video URL (e.g.
+        resolved from {{browser_url}}) could "verify" successfully even
+        when the browser never left the search results page — exactly
+        the silent-failure pattern that let a broken plan report all-green
+        checkmarks while doing nothing useful. The search-engine-domain
+        shortcut now only applies when action == SEARCH_WEB, since landing
+        on duckduckgo.com/google.com IS the correct, intended outcome for
+        that specific action — for navigate, it almost always means the
+        navigation failed to go anywhere.
+        """
+        if not current_url:
+            return (
+                VerificationStatus.UNCERTAIN,
+                "Browser did not return current URL",
+            )
+ 
+        def normalize(s: str) -> str:
+            return (
+                s.lower()
+                .replace(" ", "")
+                .replace("+", "")
+                .replace("%20", "")
+                .replace("-", "")
+                .rstrip("/")
+            )
+ 
+        target_norm  = normalize(expected_target)
+        current_norm = normalize(current_url)
+ 
+        target_words = [
+            w for w in target_norm.split()
+            if len(w) > 3
+        ] if " " in expected_target else [target_norm]
+ 
+        is_search_engine_domain = (
+            "duckduckgo.com" in current_url or "google.com" in current_url
+        )
+ 
+        if is_search_engine_domain:
+            if action == ActionType.SEARCH_WEB:
+                return (
+                    VerificationStatus.SUCCESS,
+                    f"Search page loaded: {current_url}"
+                )
+            # For navigate (or any other action), landing on a search
+            # engine domain when we expected to go somewhere else is a
+            # signal the navigation didn't actually happen — surface it
+            # as UNCERTAIN rather than a false SUCCESS, so retry/replan
+            # logic gets a chance to react instead of moving on silently.
+            return (
+                VerificationStatus.UNCERTAIN,
+                f"Still on search engine page, expected to navigate to "
+                f"'{expected_target}': {current_url}"
+            )
+ 
+        if target_norm in current_norm or current_norm in target_norm:
+            return VerificationStatus.SUCCESS, f"Browser is at: {current_url}"
+ 
         return (
             VerificationStatus.UNCERTAIN,
-            "Browser did not return current URL",
+            f"URL may be correct: {current_url}",
         )
-
-    # Normalize both for comparison
-    # Replace spaces and URL encoding variants
-    def normalize(s: str) -> str:
-        return (
-            s.lower()
-            .replace(" ", "")
-            .replace("+", "")
-            .replace("%20", "")
-            .replace("-", "")
-            .rstrip("/")
-        )
-
-    target_norm  = normalize(expected_target)
-    current_norm = normalize(current_url)
-
-    # Check if key words from target appear in URL
-    target_words = [
-        w for w in target_norm.split()
-        if len(w) > 3  # skip short words
-    ] if " " in expected_target else [target_norm]
-
-    # For search URLs, check the domain loaded correctly
-    if "duckduckgo.com" in current_url or "google.com" in current_url:
-        return (
-            VerificationStatus.SUCCESS,
-            f"Search page loaded: {current_url}"
-        )
-
-    if target_norm in current_norm or current_norm in target_norm:
-        return VerificationStatus.SUCCESS, f"Browser is at: {current_url}"
-
-    return (
-        VerificationStatus.UNCERTAIN,
-        f"URL may be correct: {current_url}",
-    )
 
 
 def _verify_text_typed(
