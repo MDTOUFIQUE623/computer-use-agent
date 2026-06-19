@@ -526,10 +526,40 @@ def complete_node(state: GraphState) -> dict:
     start_ms = state.get("task_start_ms", 0)
     elapsed  = int(time.monotonic() * 1000) - start_ms
  
+    # BUGFIX (Phase 2.5b follow-up): step_results contains one entry per
+    # VERIFICATION ATTEMPT, not one entry per distinct step. A step that
+    # failed and was retried (e.g. via replan) contributes multiple
+    # entries under the same step_number before eventually being skipped
+    # or succeeding. The old `len(results)/plan.total_steps` print could
+    # therefore show something impossible like "5/4" whenever any step
+    # needed more than one verification attempt — accurate to the
+    # underlying list length, but misleading as a "completion ratio".
+    #
+    # Report distinct steps attempted, and separately call out how many
+    # ultimately failed-and-were-skipped vs the raw attempt count, so the
+    # summary stays honest without hiding the retry activity.
+    distinct_step_numbers = {r.step_number for r in results}
+    failed_step_numbers = {
+        r.step_number for r in results
+        if r.status == VerificationStatus.FAILED
+    }
+    # A step only counts as "skipped" if its LAST recorded attempt was
+    # still FAILED (i.e. it never recovered via retry/replan/fallback).
+    last_status_per_step: dict[int, VerificationStatus] = {}
+    for r in results:
+        last_status_per_step[r.step_number] = r.status
+    skipped_step_numbers = {
+        num for num, status in last_status_per_step.items()
+        if status == VerificationStatus.FAILED
+    }
+ 
     print(f"\n{'='*50}")
     print(f"  TASK COMPLETE")
     print(f"{'='*50}")
-    print(f"  Steps executed: {len(results)}/{plan.total_steps}")
+    print(f"  Steps attempted:   {len(distinct_step_numbers)}/{plan.total_steps}")
+    if skipped_step_numbers:
+        print(f"  Steps skipped:     {sorted(skipped_step_numbers)} (failed after retries, non-blocking)")
+    print(f"  Verification calls: {len(results)} (includes retries)")
     print(f"  Total time:     {elapsed}ms")
  
     slots = state.get("slots")
