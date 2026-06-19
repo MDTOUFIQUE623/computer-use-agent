@@ -31,6 +31,7 @@ class ActionType(str, Enum):
     # Browser
     NAVIGATE      = "navigate"
     SEARCH_WEB    = "search_web"
+    SEARCH_ON_PAGE = "search_on_page"
     CLICK_ELEMENT = "click_element"
     FILL_FORM     = "fill_form"
     EXTRACT_TEXT  = "extract_text"
