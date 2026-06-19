@@ -710,6 +710,8 @@ class BrowserTools:
                 error=str(e),
                 duration_ms=_ms(start)
             )
+        
+
 
     # -----------------------------------------------------------------------
     # Private helpers
@@ -918,6 +920,114 @@ class BrowserTools:
                 error=str(e),
                 duration_ms=_ms(start)
             )
+        
+    def search_on_page(
+        self,
+        query: str,
+        timeout_ms: int = 5000,
+    ) -> ToolResult:
+        """
+        Find and use the search box already present on the current page,
+        instead of leaving for an external search engine.
+ 
+        Use this when you're already on a site (YouTube, GitHub, Amazon,
+        a docs site, etc.) and want to search WITHIN that site — e.g.
+        "search YouTube for X" after already navigating to youtube.com.
+        This is the semantic counterpart to search_web(), which always
+        exits to DuckDuckGo regardless of what page you're currently on.
+ 
+        Tries a fallback chain of common search-input patterns since
+        sites don't agree on markup. First visible match wins. Fills
+        the field and presses Enter to submit — mirrors the existing
+        fill_field + press_key pattern used elsewhere in this class.
+ 
+        Returns success=False with error="NoSearchBoxFound" if nothing
+        in the fallback chain matches — callers (graph.py / Brain) can
+        then fall back to search_web() instead.
+        """
+        start = time.monotonic()
+        try:
+            self._ensure_started()
+ 
+            # Tried in order, most specific/reliable first. Each entry
+            # is a CSS selector. Stops at the first one that exists AND
+            # is visible — an element can exist in the DOM but be
+            # hidden (e.g. a collapsed mobile search icon), which would
+            # make fill() fail or fill the wrong thing silently.
+            selector_candidates = [
+                'input[name="search_query"]',          # YouTube
+                'input[type="search"]',                # HTML5 semantic search
+                'input[aria-label*="Search" i]',        # accessibility-labeled
+                'input[placeholder*="Search" i]',       # placeholder-based
+                '[role="search"] input',                # search landmark region
+                'input#search',
+                'input.search',
+            ]
+ 
+            found_selector = None
+            for selector in selector_candidates:
+                try:
+                    locator = self._page.locator(selector).first
+                    if locator.count() > 0 and locator.is_visible():
+                        found_selector = selector
+                        break
+                except Exception:
+                    # A malformed/unsupported selector on this particular
+                    # page shouldn't abort the whole search — try the
+                    # next candidate.
+                    continue
+ 
+            if found_selector is None:
+                return ToolResult(
+                    success=False,
+                    message=(
+                        f"No search box found on current page "
+                        f"({self._page.url}) — tried {len(selector_candidates)} "
+                        f"common patterns"
+                    ),
+                    error="NoSearchBoxFound",
+                    data={"current_url": self._page.url},
+                    duration_ms=_ms(start)
+                )
+ 
+            # Fill and submit — reuse the same interaction pattern as
+            # fill_field + press_key rather than duplicating it.
+            self._page.fill(found_selector, query)
+            time.sleep(ACTION_COOLDOWN)
+            self._page.locator(found_selector).first.press("Enter")
+            time.sleep(ACTION_COOLDOWN)
+ 
+            # Give the results time to render before anything downstream
+            # (e.g. click_element on a result) tries to interact with them.
+            try:
+                self._page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+            except PlaywrightTimeout:
+                # Not fatal — some sites update results via JS without a
+                # full navigation/load event. Proceed; verification
+                # downstream will catch a genuinely failed search.
+                pass
+ 
+            return ToolResult(
+                success=True,
+                message=f"Searched on-page for '{query}' using {found_selector}",
+                data={
+                    "current_url": self._page.url,
+                    "page_title":  self._page.title(),
+                    "query":       query,
+                    "selector_used": found_selector,
+                },
+                duration_ms=_ms(start)
+            )
+ 
+        except Exception as e:
+            log.error("search_on_page failed for '%s': %s", query, e)
+            return ToolResult(
+                success=False,
+                message=f"Failed to search on-page for '{query}'",
+                error=str(e),
+                duration_ms=_ms(start)
+            )
+    
 
     def get_element_text_by_selector(self, selector: str) -> ToolResult:
         """
@@ -1329,6 +1439,9 @@ class BrowserTools:
             log.error("Summarization failed, returning raw: %s", e)
             # Return raw extract if summarization fails
             return extract_result
+        
+
+    
 
 
 
@@ -1427,6 +1540,7 @@ def build_executor():
         action_map = {
             ActionType.NAVIGATE:          lambda: bt.navigate(target),
             ActionType.SEARCH_WEB:        lambda: bt.search_web(target),
+            ActionType.SEARCH_ON_PAGE:    lambda: bt.search_on_page(target),
             ActionType.CLICK_ELEMENT:     lambda: bt.click_element(text=target),
             ActionType.FILL_FORM:         lambda: bt.fill_field(
                 target, step.value or ""
