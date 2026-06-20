@@ -1029,6 +1029,164 @@ class BrowserTools:
             )
     
 
+    def click_best_result(
+        self,
+        query: str,
+        max_candidates: int = 8,
+    ) -> ToolResult:
+        """
+        Click whichever visible result item best matches `query`, instead
+        of guessing literal visible text (which click_element requires
+        and which is unreliable for dynamic result lists — you can't
+        know a YouTube video's exact title ahead of time).
+ 
+        Use this after search_on_page() (or search_web/get_first_result)
+        when you need to act on "the most relevant result" rather than
+        a specific known element.
+ 
+        How it works:
+          1. Try a fallback chain of common result-container selectors
+             (YouTube's renderer elements first, then generic patterns)
+             until one finds visible candidates.
+          2. Score each candidate's visible text against the query —
+             same keyword-overlap approach get_first_result_url() uses
+             for search engine links, applied here to on-page elements.
+          3. Click the highest-scoring candidate. Ties broken by
+             position (earlier in the list wins, since result lists are
+             usually already relevance-ordered).
+          4. If every candidate scores 0 (no query words found in any
+             title), still clicks the first one as a best-effort
+             default, but flags low_confidence=True in the returned
+             data so callers/logs know it was a guess rather than a
+             real match.
+ 
+        Returns success=False with error="NoResultsFound" if the
+        selector fallback chain finds nothing at all.
+        """
+        start = time.monotonic()
+        try:
+            self._ensure_started()
+ 
+            # Tried in order, most specific/reliable first.
+            selector_candidates = [
+                "ytd-video-renderer",           # YouTube search results
+                "ytd-compact-video-renderer",   # YouTube sidebar/compact results
+                '[data-testid*="result" i]',    # generic test-id convention
+                ".search-result",
+                ".result-item",
+                "article",                      # semantic HTML fallback
+            ]
+ 
+            found_selector = None
+            candidate_locators = None
+ 
+            for selector in selector_candidates:
+                try:
+                    locator = self._page.locator(selector)
+                    count = locator.count()
+                    if count > 0:
+                        found_selector = selector
+                        candidate_locators = locator
+                        break
+                except Exception:
+                    continue
+ 
+            if found_selector is None:
+                return ToolResult(
+                    success=False,
+                    message=(
+                        f"No result items found on current page "
+                        f"({self._page.url}) — tried {len(selector_candidates)} "
+                        f"common patterns"
+                    ),
+                    error="NoResultsFound",
+                    data={"current_url": self._page.url},
+                    duration_ms=_ms(start)
+                )
+ 
+            # Score up to max_candidates visible items. Cap exists
+            # because scoring (and the inner_text() calls it requires)
+            # has real cost per element, and result pages can have
+            # dozens/hundreds of items — the top N is what a human would
+            # actually look at anyway.
+            total_count = candidate_locators.count()
+            n_to_check  = min(total_count, max_candidates)
+ 
+            query_words = [w.lower() for w in query.split() if len(w) > 2]
+ 
+            scored: list[tuple[int, int, str]] = []  # (score, position, text)
+            for i in range(n_to_check):
+                item = candidate_locators.nth(i)
+                try:
+                    if not item.is_visible():
+                        continue
+                    text = (item.inner_text() or "").strip()
+                except Exception:
+                    continue
+ 
+                if not text:
+                    continue
+ 
+                text_lower = text.lower()
+                score = sum(1 for w in query_words if w in text_lower)
+                scored.append((score, i, text))
+ 
+            if not scored:
+                return ToolResult(
+                    success=False,
+                    message=(
+                        f"Found {found_selector} elements but none had "
+                        f"readable visible text"
+                    ),
+                    error="NoReadableCandidates",
+                    data={"current_url": self._page.url, "selector": found_selector},
+                    duration_ms=_ms(start)
+                )
+ 
+            # Highest score first; earlier position breaks ties.
+            scored.sort(key=lambda s: (-s[0], s[1]))
+            best_score, best_pos, best_text = scored[0]
+            low_confidence = best_score == 0
+ 
+            winner = candidate_locators.nth(best_pos)
+            winner.scroll_into_view_if_needed(timeout=DEFAULT_TIMEOUT)
+            winner.click(timeout=DEFAULT_TIMEOUT)
+            time.sleep(ACTION_COOLDOWN)
+ 
+            return ToolResult(
+                success=True,
+                message=(
+                    f"Clicked best-matching result: '{best_text[:60]}' "
+                    f"(score={best_score}{', low confidence' if low_confidence else ''})"
+                ),
+                data={
+                    "current_url":    self._page.url,
+                    "page_title":     self._page.title(),
+                    "matched_title":  best_text,
+                    "score":          best_score,
+                    "low_confidence": low_confidence,
+                    "selector_used":  found_selector,
+                    "candidates_considered": len(scored),
+                },
+                duration_ms=_ms(start)
+            )
+ 
+        except PlaywrightTimeout:
+            return ToolResult(
+                success=False,
+                message="Timed out clicking the best-matching result",
+                error="Timeout",
+                duration_ms=_ms(start)
+            )
+        except Exception as e:
+            log.error("click_best_result failed for '%s': %s", query, e)
+            return ToolResult(
+                success=False,
+                message=f"Failed to click best result for '{query}'",
+                error=str(e),
+                duration_ms=_ms(start)
+            )
+
     def get_element_text_by_selector(self, selector: str) -> ToolResult:
         """
         Read the text content of a specific DOM element.
@@ -1439,6 +1597,8 @@ class BrowserTools:
             log.error("Summarization failed, returning raw: %s", e)
             # Return raw extract if summarization fails
             return extract_result
+
+    
         
 
     
@@ -1542,6 +1702,7 @@ def build_executor():
             ActionType.SEARCH_WEB:        lambda: bt.search_web(target),
             ActionType.SEARCH_ON_PAGE:    lambda: bt.search_on_page(target),
             ActionType.CLICK_ELEMENT:     lambda: bt.click_element(text=target),
+            ActionType.CLICK_BEST_RESULT: lambda: bt.click_best_result(target),
             ActionType.FILL_FORM:         lambda: bt.fill_field(
                 target, step.value or ""
             ),

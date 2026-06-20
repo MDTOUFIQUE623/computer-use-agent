@@ -68,6 +68,25 @@ AVAILABLE TOOLS AND ACTIONS:
          (DuckDuckGo), which abandons the site you just navigated to and
          searches the open web instead. This is wrong whenever the task
          names a specific site to search within.
+         CLICKING A SEARCH/RESULT ITEM — CRITICAL ROUTING RULE:
+         click_best_result(target=query):
+         Use this instead of click_element whenever you need to click
+         "the most relevant result" from a list of search/video/product
+         results, and you do NOT know the exact visible text of that
+         result ahead of time (you usually don't — result titles are
+         dynamic content you can't predict from the task description).
+         It reads the actual visible candidates on the page, scores them
+         against your query, and clicks the best match.
+ 
+         Only use click_element instead when the text to click is
+         actually known/fixed — a named button ("Submit", "Sign in"), a
+         menu item, a specific link whose label was given in the task.
+ 
+         NEVER use click_element with a generic guess like "video",
+         "first result", "play button" as the target text — that text
+         almost certainly does not exist verbatim anywhere on the page,
+         and click_element will fail with a timeout. Use
+         click_best_result for this instead.
  
        LOW-LEVEL ACTIONS (only when you need specific control):
        search_web → navigate → extract_text
@@ -93,10 +112,13 @@ EXAMPLES OF CORRECT PLANS:
   "go to youtube.com and search for X and play the video":
     step 1: browser / navigate / target="https://www.youtube.com"
     step 2: browser / search_on_page / target="X"
-    step 3: browser / click_element / target="<first video title text, if known, else 'video'>"
-        (Do NOT use search_web here — it would leave YouTube entirely
-        and search DuckDuckGo instead, which has no relation to the
-        YouTube page you just navigated to.)
+    step 3: browser / click_best_result / target="X"
+        (Do NOT use search_web for step 2 — it would leave YouTube
+        entirely and search DuckDuckGo instead. Do NOT use click_element
+        for step 3 with a guessed target like "video" or "first result"
+        — that text won't exist on the page. click_best_result reads the
+        actual result titles and picks the closest match to the search
+        query X.)
 
 3. files — File and folder operations (pure Python)
    Actions: move_file, copy_file, rename_file, delete_file,
@@ -104,9 +126,15 @@ EXAMPLES OF CORRECT PLANS:
             write_file
 
 4. apps — App-specific integrations
-   Actions: spotify_play, spotify_pause, spotify_next,
-            spotify_playlist, notion_create_page, notion_append,
-            clipboard_copy, clipboard_paste, volume_set, wait
+       Actions: spotify_play, spotify_pause, spotify_next,
+                spotify_playlist, notion_create_page, notion_append,
+                clipboard_copy, clipboard_paste, volume_set, wait
+ 
+       NOTE: "wait" (pausing for N seconds) is ALWAYS tool=apps,
+       action=wait, value="<seconds>" — even in the middle of a browser
+       or windows_ui sequence. There is no browser/wait or windows_ui/wait
+       action. Example: tool=apps / action=wait / value="5" pauses 5
+       seconds regardless of what the surrounding steps are doing.
 
 5. ocr — Screen text reading via Tesseract (fallback)
    Actions: click, type_text
@@ -134,6 +162,8 @@ ROUTING RULES:
       - Opening native Windows apps → use windows_ui
       - Spotify control → use apps tool
       - Notion tasks → use apps tool
+      - Waiting/pausing for N seconds → ALWAYS tool=apps, action=wait
+        (never browser/wait or windows_ui/wait — those don't exist)
       - Electron apps (WhatsApp, Spotify UI) → use ocr as primary,
         vision as fallback
       - Unknown UI elements → try windows_ui first, then ocr, then vision
@@ -236,7 +266,7 @@ Rules:
 
 CRITICAL: Only use these exact action values:
     open_app, close_app, focus_app, click, type_text, press_key, scroll, select,
-    navigate, search_web, search_on_page, click_element, fill_form, extract_text, wait_for_page,
+    navigate, search_web, search_on_page, click_element, click_best_result, fill_form, extract_text, wait_for_page,
     get_first_result, move_file, copy_file, rename_file, delete_file, create_folder, list_files,
     find_files, organize_files, write_file, spotify_play, spotify_pause, spotify_next,
     spotify_playlist, notion_create_page, notion_append, clipboard_copy,

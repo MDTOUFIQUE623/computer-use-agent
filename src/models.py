@@ -33,6 +33,7 @@ class ActionType(str, Enum):
     SEARCH_WEB    = "search_web"
     SEARCH_ON_PAGE = "search_on_page"
     CLICK_ELEMENT = "click_element"
+    CLICK_BEST_RESULT = "click_best_result"
     FILL_FORM     = "fill_form"
     EXTRACT_TEXT  = "extract_text"
     WAIT_FOR_PAGE = "wait_for_page"
