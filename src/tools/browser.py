@@ -936,25 +936,25 @@ class BrowserTools:
         This is the semantic counterpart to search_web(), which always
         exits to DuckDuckGo regardless of what page you're currently on.
  
-        Tries a fallback chain of common search-input patterns since
-        sites don't agree on markup. First visible match wins. Fills
-        the field and presses Enter to submit — mirrors the existing
-        fill_field + press_key pattern used elsewhere in this class.
+        Two-pass strategy:
+          Pass 1: try a fallback chain of common search-input patterns
+                   that are directly fillable on page load (YouTube,
+                   Amazon-style sites, most docs sites).
+          Pass 2: if pass 1 finds nothing, try clicking a "reveal search"
+                   trigger first (sites like GitHub hide the real input
+                   inside a modal/dialog until a trigger element is
+                   clicked), then retry pass 1's selector chain against
+                   whatever pass 2's click revealed.
  
-        Returns success=False with error="NoSearchBoxFound" if nothing
-        in the fallback chain matches — callers (graph.py / Brain) can
-        then fall back to search_web() instead.
+        Returns success=False with error="NoSearchBoxFound" if neither
+        pass finds anything. Callers (graph.py / Brain) can then fall
+        back to search_web() instead.
         """
         start = time.monotonic()
         try:
             self._ensure_started()
  
-            # Tried in order, most specific/reliable first. Each entry
-            # is a CSS selector. Stops at the first one that exists AND
-            # is visible — an element can exist in the DOM but be
-            # hidden (e.g. a collapsed mobile search icon), which would
-            # make fill() fail or fill the wrong thing silently.
-            selector_candidates = [
+            input_selector_candidates = [
                 'input[name="search_query"]',          # YouTube
                 'input[type="search"]',                # HTML5 semantic search
                 'input[aria-label*="Search" i]',        # accessibility-labeled
@@ -964,47 +964,86 @@ class BrowserTools:
                 'input.search',
             ]
  
-            found_selector = None
-            for selector in selector_candidates:
-                try:
-                    locator = self._page.locator(selector).first
-                    if locator.count() > 0 and locator.is_visible():
-                        found_selector = selector
-                        break
-                except Exception:
-                    # A malformed/unsupported selector on this particular
-                    # page shouldn't abort the whole search — try the
-                    # next candidate.
-                    continue
+            def _find_visible_input() -> Optional[str]:
+                """Try the input chain once, return the first selector
+                that matches a visible element, or None."""
+                for selector in input_selector_candidates:
+                    try:
+                        locator = self._page.locator(selector).first
+                        if locator.count() > 0 and locator.is_visible():
+                            return selector
+                    except Exception:
+                        continue
+                return None
+ 
+            # --- Pass 1: direct input, no click needed ---
+            found_selector = _find_visible_input()
+ 
+            # --- Pass 2: click-to-reveal trigger, then retry pass 1 ---
+            if found_selector is None:
+                # Trigger patterns, tried in order. Text-based matching
+                # first since it's the most robust against markup
+                # changes — "Search or jump to" is GitHub's stable,
+                # visible boilerplate text present on every page.
+                # Generic role/aria-label patterns follow as fallbacks
+                # for other click-to-reveal sites with different wording.
+                trigger_strategies = [
+                    lambda: self._page.get_by_text("Search or jump to", exact=False).first,
+                    lambda: self._page.get_by_role("button", name="Search", exact=False).first,
+                    lambda: self._page.locator('button[aria-label*="Search" i]').first,
+                    lambda: self._page.locator('[role="button"][aria-label*="Search" i]').first,
+                ]
+ 
+                for get_trigger in trigger_strategies:
+                    try:
+                        trigger = get_trigger()
+                        if trigger.count() == 0 or not trigger.is_visible():
+                            continue
+ 
+                        trigger.click(timeout=DEFAULT_TIMEOUT)
+                        time.sleep(ACTION_COOLDOWN)
+ 
+                        # Give the modal/dialog time to render before
+                        # re-checking for an input.
+                        try:
+                            self._page.wait_for_timeout(500)
+                        except Exception:
+                            pass
+ 
+                        found_selector = _find_visible_input()
+                        if found_selector:
+                            log.info(
+                                "search_on_page: revealed search input "
+                                "via click-to-reveal trigger"
+                            )
+                            break
+ 
+                    except Exception:
+                        # This trigger strategy didn't work — try the
+                        # next one rather than giving up immediately.
+                        continue
  
             if found_selector is None:
                 return ToolResult(
                     success=False,
                     message=(
                         f"No search box found on current page "
-                        f"({self._page.url}) — tried {len(selector_candidates)} "
-                        f"common patterns"
+                        f"({self._page.url}) — tried direct input "
+                        f"patterns and click-to-reveal triggers"
                     ),
                     error="NoSearchBoxFound",
                     data={"current_url": self._page.url},
                     duration_ms=_ms(start)
                 )
  
-            # Fill and submit — reuse the same interaction pattern as
-            # fill_field + press_key rather than duplicating it.
             self._page.fill(found_selector, query)
             time.sleep(ACTION_COOLDOWN)
             self._page.locator(found_selector).first.press("Enter")
             time.sleep(ACTION_COOLDOWN)
  
-            # Give the results time to render before anything downstream
-            # (e.g. click_element on a result) tries to interact with them.
             try:
                 self._page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
             except PlaywrightTimeout:
-                # Not fatal — some sites update results via JS without a
-                # full navigation/load event. Proceed; verification
-                # downstream will catch a genuinely failed search.
                 pass
  
             return ToolResult(
