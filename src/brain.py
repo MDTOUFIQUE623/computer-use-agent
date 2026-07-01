@@ -263,6 +263,12 @@ Rules:
 - If the task says "search for X" — just search and extract, nothing else
 - If the task is impossible or unclear, set total_steps=0
   and explain in notes
+- Set completion_policy based on the task:
+  * auto_close (default): Close browser when done.
+  * keep_open: Keep browser open (e.g. if the user wants to watch a video, listen to music, or asks to leave it open).
+  * wait_for_user: Pause and wait for user input.
+  * background: Run in background.
+  * user_decides: Ask the user whether to close it or keep it open (MUST use this for playing media like youtube/music, or ambiguous tasks).
 
 CRITICAL: Only use these exact action values:
     open_app, close_app, focus_app, click, type_text, press_key, scroll, select,
@@ -270,7 +276,7 @@ CRITICAL: Only use these exact action values:
     get_first_result, move_file, copy_file, rename_file, delete_file, create_folder, list_files,
     find_files, organize_files, write_file, spotify_play, spotify_pause, spotify_next,
     spotify_playlist, notion_create_page, notion_append, clipboard_copy,
-    clipboard_paste, volume_set, wait, screenshot
+    clipboard_paste, volume_set, wait, screenshot, media_play, media_pause, media_resume, media_skip_ads, media_wait
 
 - Never invent action names. Never use: respond, display, show, open_url, type.
    target must always be a non-empty string. Never set target to null.
@@ -297,6 +303,7 @@ Return a JSON object with this exact structure:
   "total_steps": <integer>,
   "apps_involved": ["list", "of", "app", "names"],
   "estimated_complexity": "simple|medium|complex",
+  "completion_policy": "auto_close|keep_open|wait_for_user|background|user_decides (CRITICAL: use user_decides for youtube/media tasks)",
   "steps": [
     {
       "step_number": 1,
@@ -826,6 +833,7 @@ class Brain:
                 estimated_complexity = data.get(
                     "estimated_complexity", "medium"
                 ),
+                completion_policy    = data.get("completion_policy", "auto_close"),
                 steps = steps,
                 notes = data.get("notes"),
             )

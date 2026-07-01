@@ -104,6 +104,9 @@ def _route_verification(
         expected_url = data.get("current_url")
         return _verify_browser_url(expected_url, step.target, action)
 
+    if action == ActionType.CLICK_BEST_RESULT:
+        return _verify_click_best_result(tool_result, step)
+
     # --- text typed into a field ---
     if action == ActionType.TYPE_TEXT:
         typed_value   = step.value or ""
@@ -316,6 +319,39 @@ def _verify_browser_url(
             VerificationStatus.UNCERTAIN,
             f"URL may be correct: {current_url}",
         )
+
+
+def _verify_click_best_result(
+    tool_result: ToolResult,
+    step: Step,
+) -> tuple[VerificationStatus, str]:
+    if not tool_result.success:
+        return VerificationStatus.FAILED, f"Tool reported failure: {tool_result.error or tool_result.message}"
+
+    data = tool_result.data or {}
+    current_url = data.get("current_url", "")
+    page_title = data.get("page_title", "")
+    attempted_target = data.get("matched_title", "")
+
+    # Dedicated check for YouTube video clicks
+    if "/watch" in current_url:
+        try:
+            from src.graph import _get_browser_instance
+            bt = _get_browser_instance()
+            if hasattr(bt, "_page") and bt._page:
+                video_count = bt._page.locator("video").count()
+                if video_count == 0:
+                    return VerificationStatus.FAILED, f"Expected video element on {current_url}, but none found."
+                
+                return VerificationStatus.SUCCESS, f"Verified YouTube video loaded: {page_title}"
+        except Exception as e:
+            return VerificationStatus.UNCERTAIN, f"Could not verify video element: {e}"
+
+    # Generic check for other sites
+    if current_url:
+        return VerificationStatus.SUCCESS, f"Navigated to '{page_title}' at {current_url}"
+
+    return VerificationStatus.UNCERTAIN, "Could not verify click_best_result"
 
 
 def _verify_text_typed(

@@ -14,6 +14,14 @@ class ToolType(str, Enum):
     SYSTEM     = "system"
 
 
+class CompletionPolicy(str, Enum):
+    AUTO_CLOSE    = "auto_close"
+    KEEP_OPEN     = "keep_open"
+    WAIT_FOR_USER = "wait_for_user"
+    BACKGROUND    = "background"
+    USER_DECIDES  = "user_decides"
+
+
 class ActionType(str, Enum):
     # App control
     OPEN_APP   = "open_app"
@@ -40,6 +48,13 @@ class ActionType(str, Enum):
     GET_FIRST_RESULT = "get_first_result"
     SEARCH_AND_EXTRACT          = "search_and_extract"
     SEARCH_EXTRACT_AND_SUMMARIZE = "search_extract_and_summarize"
+    
+    # Media Controller (Browser)
+    MEDIA_PLAY       = "media_play"
+    MEDIA_PAUSE      = "media_pause"
+    MEDIA_RESUME     = "media_resume"
+    MEDIA_SKIP_ADS   = "media_skip_ads"
+    MEDIA_WAIT       = "media_wait"
 
     # Files
     MOVE_FILE      = "move_file"
@@ -97,6 +112,7 @@ class Plan(BaseModel):
     total_steps:          int
     apps_involved:        list[str]
     estimated_complexity: Literal["simple", "medium", "complex"]
+    completion_policy:    CompletionPolicy = CompletionPolicy.AUTO_CLOSE
     steps:                list[Step]
     notes:                Optional[str] = None
 

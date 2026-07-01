@@ -1,9 +1,22 @@
 import logging
 from typing import Optional
- 
-from pydantic import BaseModel
- 
+
+from pydantic import BaseModel, Field
+
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Browser State model
+# ---------------------------------------------------------------------------
+class BrowserState(BaseModel):
+    url: str = ""
+    title: str = ""
+    current_domain: str = ""
+    page_type: str = ""
+    selected_element: str = ""
+    history: list[str] = Field(default_factory=list)
+
  
  
 # ---------------------------------------------------------------------------
@@ -23,8 +36,7 @@ class StateSlots(BaseModel):
  
     # Browser / web research
     browser_text:  Optional[str]       = None   # extracted page text
-    browser_url:   Optional[str]       = None   # current or result URL
-    browser_title: Optional[str]       = None   # page title
+    browser:       BrowserState        = Field(default_factory=BrowserState)
  
     # Filesystem
     file_list:     Optional[list[str]] = None   # list_files / find_files results
@@ -53,8 +65,28 @@ class StateSlots(BaseModel):
         self.last_text = value
  
     def get(self, slot: str) -> Optional[object]:
-        """Safe getter — returns None for unknown slot names."""
+        """Safe getter — returns None for unknown slot names. Supports dot notation."""
+        if "." in slot:
+            obj, attr = slot.split(".", 1)
+            parent = getattr(self, obj, None)
+            return getattr(parent, attr, None) if parent else None
         return getattr(self, slot, None)
+
+    @property
+    def browser_url(self) -> Optional[str]:
+        return self.browser.url or None
+
+    @browser_url.setter
+    def browser_url(self, value: Optional[str]) -> None:
+        self.browser.url = value or ""
+
+    @property
+    def browser_title(self) -> Optional[str]:
+        return self.browser.title or None
+
+    @browser_title.setter
+    def browser_title(self, value: Optional[str]) -> None:
+        self.browser.title = value or ""
  
  
 # Map of legacy/alias placeholder names -> real slot name.
@@ -70,6 +102,11 @@ _TEXT_SLOTS = {
     "browser_text",
     "browser_url",
     "browser_title",
+    "browser.url",
+    "browser.title",
+    "browser.current_domain",
+    "browser.page_type",
+    "browser.selected_element",
     "ocr_text",
     "clipboard_text",
     "vision_result",
@@ -117,7 +154,16 @@ def describe_slots(slots: StateSlots) -> str:
     Only shows non-empty slots.
     """
     lines = []
+    if slots.browser.url:
+        lines.append(f"  browser.url: '{slots.browser.url}'")
+        if slots.browser.title:
+            lines.append(f"  browser.title: '{slots.browser.title}'")
+        if slots.browser.page_type:
+            lines.append(f"  browser.page_type: '{slots.browser.page_type}'")
+
     for field_name in slots.model_fields:
+        if field_name == "browser":
+            continue
         value = getattr(slots, field_name)
         if value is None:
             continue
