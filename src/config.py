@@ -9,8 +9,8 @@ LOG_PATH = BASE_DIR / "logs"
 LOG_PATH.mkdir(exist_ok=True)
 
 #Models
-PLANNER_MODEL="gemini-2.5-flash-lite"
-VISION_MODEL="gemini-2.5-flash-lite"
+PLANNER_MODEL="gemini-2.5-flash"
+VISION_MODEL="gemini-2.5-flash"
 
 #Response limits
 MAX_PLAN_TOKENS = 2000

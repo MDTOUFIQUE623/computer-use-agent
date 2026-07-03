@@ -263,12 +263,20 @@ Rules:
 - If the task says "search for X" — just search and extract, nothing else
 - If the task is impossible or unclear, set total_steps=0
   and explain in notes
-- Set completion_policy based on the task:
-  * auto_close (default): Close browser when done.
-  * keep_open: Keep browser open (e.g. if the user wants to watch a video, listen to music, or asks to leave it open).
-  * wait_for_user: Pause and wait for user input.
-  * background: Run in background.
-  * user_decides: Ask the user whether to close it or keep it open (MUST use this for playing media like youtube/music, or ambiguous tasks).
+- Set completion_policy based on the task (exactly one of three values):
+  * auto_close (default): Close browser when done. Use for research, lookups,
+    form-filling, or any task with no reason for the user to keep looking at the page.
+  * keep_open: Leave the browser open, no prompt. Use whenever the task's own
+    outcome IS the browser staying open and visible — e.g. "play a video",
+    "listen to music", "watch X", "leave it open", or anything where playback
+    continuing after the plan finishes is the whole point of the task.
+  * ask_user: Pause and ask the user whether to keep the browser open or close
+    it. Use ONLY for genuinely ambiguous cases where you can't tell from the
+    task whether the user wants to keep watching/using the page afterward.
+
+  Media playback (YouTube, music, video) is NOT ambiguous — always use
+  keep_open for it, never ask_user. Reserve ask_user for cases you truly
+  can't infer intent for.
 
 CRITICAL: Only use these exact action values:
     open_app, close_app, focus_app, click, type_text, press_key, scroll, select,
@@ -280,6 +288,10 @@ CRITICAL: Only use these exact action values:
 
 - Never invent action names. Never use: respond, display, show, open_url, type.
    target must always be a non-empty string. Never set target to null.
+   Exception: media_play, media_pause, media_resume, media_skip_ads,
+   media_wait, spotify_next, screenshot, and wait act on whatever is
+   already on screen/playing — for these, target is not meaningful;
+   any short placeholder (or omitting it) is fine.
 
 - NEVER add organize_files as a final step after write_file
 - NEVER add steps to "ensure" or "confirm" or "verify" file operations
@@ -303,7 +315,7 @@ Return a JSON object with this exact structure:
   "total_steps": <integer>,
   "apps_involved": ["list", "of", "app", "names"],
   "estimated_complexity": "simple|medium|complex",
-  "completion_policy": "auto_close|keep_open|wait_for_user|background|user_decides (CRITICAL: use user_decides for youtube/media tasks)",
+  "completion_policy": "auto_close|keep_open|ask_user (CRITICAL: use keep_open for youtube/media playback tasks, never ask_user)",
   "steps": [
     {
       "step_number": 1,
@@ -613,10 +625,16 @@ class Brain:
                 log.info("Replan determined step is impossible")
                 return None
 
-            # Validate required fields
+            # Validate required fields — same target-less exemption as
+            # _build_plan (see _TARGETLESS_ACTIONS): a replanned media_*
+            # step legitimately has no target, and this check used to
+            # discard it, making retries for those actions silently fail.
             if not data.get("target"):
-                log.warning("Replan returned no target")
-                return None
+                if data.get("action") in self._TARGETLESS_ACTIONS:
+                    data["target"] = "current_media"
+                else:
+                    log.warning("Replan returned no target")
+                    return None
 
             if data.get("value") is not None:
                 data["value"] = str(data["value"])
@@ -789,17 +807,75 @@ class Brain:
             log.error("Raw response was: %s", raw[:500])
             return None
 
+    # Actions that legitimately operate on "whatever's already there" rather
+    # than a specific target — a URL, search query, file path, etc. don't
+    # apply to them. Added 2026-07-02: the blanket "target required" check
+    # below predates MEDIA_* actions and was silently dropping every
+    # media-control step (e.g. "stop the song" -> media_pause), producing
+    # an empty plan and a hard failure instead of pausing the video.
+    _TARGETLESS_ACTIONS = {
+        "media_play", "media_pause", "media_resume",
+        "media_skip_ads", "media_wait",
+        "spotify_next", "screenshot", "wait",
+    }
+
+    # Maps values the model might emit that aren't in the current
+    # CompletionPolicy enum onto the closest valid equivalent. This exists
+    # because prompt wording alone can't fully constrain an LLM's enum
+    # output — a fast model under load, a stale/regressed prompt edit, a
+    # future model-backend swap (Phase 7: Ollama), or a partially-applied
+    # patch can all cause a step to arrive with a value that used to be
+    # valid or was never valid at all. Previously this hit Plan(**data)
+    # directly and raised a raw Pydantic ValidationError that killed the
+    # entire plan (see the 2026-07-02 "user_decides" incident). Better to
+    # degrade to a sane default than crash the whole task over one field.
+    _COMPLETION_POLICY_ALIASES = {
+        "auto_close": "auto_close",
+        "keep_open":  "keep_open",
+        "ask_user":   "ask_user",
+        # legacy values from the pre-collapse 5-state enum
+        "user_decides":  "ask_user",
+        "wait_for_user": "ask_user",
+        "background":    "keep_open",
+    }
+
+    def _normalize_completion_policy(self, raw_value) -> str:
+        """Coerce any completion_policy value to one CompletionPolicy accepts."""
+        if not raw_value:
+            return "auto_close"
+
+        normalized = self._COMPLETION_POLICY_ALIASES.get(str(raw_value).lower())
+        if normalized is not None:
+            return normalized
+
+        log.warning(
+            "Unrecognized completion_policy '%s' — defaulting to auto_close",
+            raw_value,
+        )
+        return "auto_close"
+
     def _build_plan(self, data: dict, task: str) -> Optional[Plan]:
         try:
             steps = []
             for i, step_data in enumerate(data.get("steps", [])):
                 try:
-                    # Skip steps with None or missing target
+                    action_str = step_data.get("action")
+                    is_targetless = action_str in self._TARGETLESS_ACTIONS
+
+                    # Skip steps with None or missing target — UNLESS the
+                    # action is one of the target-less ones above, in which
+                    # case default to a short descriptive placeholder. The
+                    # placeholder is never read by any executor for these
+                    # actions; it exists purely so Step.target (a required
+                    # str field) has something readable to print in logs.
                     if not step_data.get("target"):
-                        log.warning(
-                            "Skipping step %d: missing target", i + 1
-                        )
-                        continue
+                        if is_targetless:
+                            step_data["target"] = "current_media"
+                        else:
+                            log.warning(
+                                "Skipping step %d: missing target", i + 1
+                            )
+                            continue
 
                     # Coerce string enums
                     step_data["tool"]   = ToolType(step_data["tool"])
@@ -833,7 +909,9 @@ class Brain:
                 estimated_complexity = data.get(
                     "estimated_complexity", "medium"
                 ),
-                completion_policy    = data.get("completion_policy", "auto_close"),
+                completion_policy    = self._normalize_completion_policy(
+                    data.get("completion_policy")
+                ),
                 steps = steps,
                 notes = data.get("notes"),
             )

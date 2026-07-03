@@ -15,11 +15,20 @@ class ToolType(str, Enum):
 
 
 class CompletionPolicy(str, Enum):
-    AUTO_CLOSE    = "auto_close"
-    KEEP_OPEN     = "keep_open"
-    WAIT_FOR_USER = "wait_for_user"
-    BACKGROUND    = "background"
-    USER_DECIDES  = "user_decides"
+    """
+    Controls what happens to the browser when a task finishes.
+
+    Collapsed from 5 states to 3 (2026-07-01 review): the previous
+    KEEP_OPEN / WAIT_FOR_USER / BACKGROUND / USER_DECIDES split had four
+    names but only two actual behaviors in graph.py — WAIT_FOR_USER and
+    BACKGROUND silently fell through to the same generic "leave it open"
+    branch as KEEP_OPEN, despite their names promising to pause/background
+    the task. Every state below now has one distinct, real implementation
+    in graph.py's complete_node/failed_node.
+    """
+    AUTO_CLOSE = "auto_close"  # close the browser, no prompt
+    KEEP_OPEN  = "keep_open"   # leave the browser open, no prompt
+    ASK_USER   = "ask_user"    # pause and ask the user what to do
 
 
 class ActionType(str, Enum):

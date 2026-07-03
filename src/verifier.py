@@ -333,8 +333,11 @@ def _verify_click_best_result(
     page_title = data.get("page_title", "")
     attempted_target = data.get("matched_title", "")
 
-    # Dedicated check for YouTube video clicks
-    if "/watch" in current_url:
+    # Dedicated check for YouTube video clicks. Scoped to youtube.com
+    # specifically — "/watch" alone isn't a safe signal (e.g. a
+    # "watchlist" page on an unrelated site would wrongly get held to
+    # the strict "must have a <video> tag" bar otherwise).
+    if "youtube.com" in current_url and "/watch" in current_url:
         try:
             from src.graph import _get_browser_instance
             bt = _get_browser_instance()

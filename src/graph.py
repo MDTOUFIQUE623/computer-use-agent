@@ -589,11 +589,17 @@ def complete_node(state: GraphState) -> dict:
     policy = getattr(plan, "completion_policy", "auto_close") if plan else "auto_close"
     if policy == "auto_close":
         _close_browser_instance()
-    elif policy == "user_decides":
-        print("\n[ACTION NEEDED]\nEverything is ready. Would you like me to keep the browser open?")
+    elif policy == "keep_open":
+        print("\n[LIFECYCLE] Leaving browser open — task result is meant to stay visible.")
+    elif policy == "ask_user":
+        print("\n[ACTION NEEDED]\nEverything is ready. Would you like me to keep the browser open? (leaving it open for now)")
     else:
-        print(f"\n[LIFECYCLE] Completion policy is '{policy}'. Leaving browser open.")
-        
+        # Unknown/legacy value (e.g. an old saved Plan from before the
+        # policy collapse) — fail safe by closing rather than leaking
+        # a browser instance indefinitely.
+        log.warning("Unknown completion_policy '%s' — defaulting to auto_close", policy)
+        _close_browser_instance()
+
     return {"is_done": True}
 
 
@@ -612,11 +618,14 @@ def failed_node(state: GraphState) -> dict:
     policy = getattr(plan, "completion_policy", "auto_close") if plan else "auto_close"
     if policy == "auto_close":
         _close_browser_instance()
-    elif policy == "user_decides":
-        print("\n[ACTION NEEDED]\nTask failed. Would you like me to keep the browser open?")
+    elif policy == "keep_open":
+        print("\n[LIFECYCLE] Leaving browser open despite failure — you may want to inspect the page.")
+    elif policy == "ask_user":
+        print("\n[ACTION NEEDED]\nTask failed. Would you like me to keep the browser open? (leaving it open for now)")
     else:
-        print(f"\n[LIFECYCLE] Completion policy is '{policy}'. Leaving browser open despite failure.")
-        
+        log.warning("Unknown completion_policy '%s' — defaulting to auto_close", policy)
+        _close_browser_instance()
+
     return {"is_done": True, "is_failed": True}
 
 

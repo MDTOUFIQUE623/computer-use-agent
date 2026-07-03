@@ -1,4 +1,3 @@
-
 import time
 import logging
 from typing import Optional
@@ -1573,13 +1572,32 @@ Content:
         """
         Auto-start the browser if not already running.
         In attach mode: reconnects if Chrome dropped the CDP connection.
+
+        Also detects a stale `self._page` reference — e.g. the user
+        manually closed just that one tab (KEEP_OPEN policy leaves a tab
+        open between tasks, and CDP attach mode means it's a real tab the
+        user can close). `self._browser.is_connected()` only reflects the
+        browser-level CDP connection; a closed individual page still
+        leaves `self._page` as a non-None Python object that raises
+        "Target closed" on first use. Checking `is_closed()` catches that
+        case and transparently opens a fresh page instead of crashing.
         """
         if not self._browser or not self._browser.is_connected():
             result = self.start()
             if not result.success:
                 raise RuntimeError(f"Browser failed to start: {result.error}")
 
-        if not self._page:
+        page_is_stale = False
+        if self._page is not None:
+            try:
+                page_is_stale = self._page.is_closed()
+            except Exception:
+                # Any error reading state off the page means it's unusable.
+                page_is_stale = True
+
+        if self._page is None or page_is_stale:
+            if page_is_stale:
+                log.info("Detected closed/stale page — opening a fresh tab")
             # In attach mode we always open a new page here; the context
             # already points to the real browser's default context.
             self._page = self._context.new_page()
@@ -1775,19 +1793,45 @@ class MediaController:
             return ToolResult(success=False, message=f"Error checking for ads: {e}", error="SkipAdFailed", data={})
 
     def wait_until_finished(self) -> "ToolResult":
+        """
+        Block until the current page's <video> element finishes playing.
+
+        This is a genuinely blocking call — it runs inside the graph's
+        synchronous execute_node, which means the whole agent (including
+        the main.py REPL prompt for the next task) is unresponsive for
+        the duration. That's fine for short clips but easy to mistake for
+        a hang on long videos, so we print an explicit notice up front
+        with the Ctrl+C escape hatch spelled out (KeyboardInterrupt during
+        time.sleep propagates normally and is caught by main.py).
+
+        Also proactively skips ads once per poll interval — without this,
+        an ad interrupting playback just sits there since v.ended never
+        fires on an ad break, and the loop would silently stall for the
+        full max_duration.
+        """
         try:
             self.bt._ensure_started()
             if self.bt._page is None:
                 return ToolResult(success=False, message="Browser not open", error="NoBrowser", data={})
-            
-            # Simple blocking wait checking every 5 seconds until video ends
-            # Note: The agent framework handles long-running tools by yielding thread/process,
-            # but for this MVP blocking wait is acceptable.
+
             poll_interval = 5.0
-            max_duration = 3600.0 # 1 hour max
+            max_duration = 3600.0  # 1 hour max
             start_time = time.monotonic()
-            
+
+            print(
+                "[MEDIA_WAIT] Waiting for video to finish "
+                f"(checking every {int(poll_interval)}s, up to {int(max_duration // 60)} min max). "
+                "Press Ctrl+C to cancel and continue."
+            )
+
             while (time.monotonic() - start_time) < max_duration:
+                # Proactively clear ads each cycle so a mid-roll break
+                # doesn't stall this loop until max_duration.
+                try:
+                    self.skip_skippable_ads()
+                except Exception:
+                    pass  # non-fatal — ad skipping is best-effort here
+
                 is_ended = self.bt._page.evaluate('''() => { 
                     const v = document.querySelector("video"); 
                     return !v || v.ended;
@@ -1795,7 +1839,7 @@ class MediaController:
                 if is_ended:
                     return ToolResult(success=True, message="Video finished playing", data={"duration_ms": _ms(start_time)})
                 time.sleep(poll_interval)
-                
+
             return ToolResult(success=False, message="Video didn't finish within 1 hour limit", error="Timeout", data={})
         except Exception as e:
             return ToolResult(success=False, message=f"Failed while waiting for video: {e}", error="MediaWaitFailed", data={})
