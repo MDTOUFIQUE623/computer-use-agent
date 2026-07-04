@@ -422,6 +422,27 @@ def verify_node(state: GraphState) -> dict:
     }
 
 
+def _count_successful_steps(step_results: list) -> int:
+    """
+    Count DISTINCT steps that reached SUCCESS, not raw len(step_results).
+
+    step_results accumulates one entry per verify_node call, including
+    every failed retry attempt of the SAME step — not just one entry per
+    step. Using len(step_results) directly as a stand-in for "how many
+    steps have succeeded" over-counts badly whenever any step needed a
+    retry, and is degenerately wrong for single-step plans (a single step
+    that fails 3 times before giving up already has 3+ entries, which
+    incorrectly looks like "steps_completed >= len(plan.steps) - 1" even
+    though ZERO steps actually succeeded). Bug observed 2026-07-02: a
+    1-step plan whose only step failed was reported as "TASK COMPLETE"
+    with an empty result instead of a genuine failure.
+    """
+    return len({
+        r.step_number for r in step_results
+        if r.status == VerificationStatus.SUCCESS
+    })
+
+
 def retry_node(state: GraphState) -> dict:
     plan        = state["plan"]
     index       = state["current_step_index"]
@@ -438,11 +459,18 @@ def retry_node(state: GraphState) -> dict:
             reason=state.get("last_error", "unknown"),
         )
 
-        is_last_step    = index >= len(plan.steps) - 1
-        steps_completed = len(state.get("step_results", []))
-        majority_done   = steps_completed >= (len(plan.steps) - 1)
+        steps_completed = _count_successful_steps(state.get("step_results", []))
+        # Only treat "we're basically done, skip this one" as valid if at
+        # least one OTHER step has genuinely succeeded. Without the
+        # steps_completed > 0 guard, a 1-step plan's only step failing
+        # would satisfy majority_done (>= 0) vacuously, and is_last_step
+        # is trivially true for any 1-step plan — both would silently
+        # skip the failure and report false success.
+        has_prior_success = steps_completed > 0
+        is_last_step      = index >= len(plan.steps) - 1
+        majority_done     = steps_completed >= (len(plan.steps) - 1)
 
-        if is_last_step or majority_done:
+        if has_prior_success and (is_last_step or majority_done):
             print(
                 f"[RETRY] Skipping optional step "
                 f"{step.step_number} — core task already complete"
@@ -518,10 +546,11 @@ def retry_node(state: GraphState) -> dict:
         )
         return {"plan": new_plan, "retry_count": retry_count}
 
-    steps_completed = len(state.get("step_results", []))
-    majority_done   = steps_completed >= (len(plan.steps) - 1)
+    steps_completed   = _count_successful_steps(state.get("step_results", []))
+    has_prior_success = steps_completed > 0
+    majority_done     = steps_completed >= (len(plan.steps) - 1)
 
-    if majority_done:
+    if has_prior_success and majority_done:
         print(
             f"[RETRY] No replan available — "
             f"skipping step {step.step_number} (majority done)"

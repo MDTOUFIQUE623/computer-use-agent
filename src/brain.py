@@ -39,7 +39,9 @@ AVAILABLE TOOLS AND ACTIONS:
 2. browser — Browser automation via Playwright
        Actions: navigate, search_web, search_on_page, click_element,
                 fill_form, extract_text, wait_for_page, get_first_result,
-                search_and_extract, search_extract_and_summarize
+                search_and_extract, search_extract_and_summarize,
+                media_play, media_pause, media_resume, media_skip_ads,
+                media_wait
  
        HIGH-LEVEL ACTIONS (prefer these):
        search_and_extract(target=query):
@@ -88,6 +90,27 @@ AVAILABLE TOOLS AND ACTIONS:
          and click_element will fail with a timeout. Use
          click_best_result for this instead.
  
+       MEDIA CONTROLS — CRITICAL ROUTING RULE:
+       media_play(target="current_media") / media_pause(target="current_media") /
+       media_resume(target="current_media") / media_skip_ads(target="current_media") /
+       media_wait(target="current_media"):
+         Controls the <video> element already loaded on the CURRENT
+         browser page (e.g. a YouTube video the agent or user just
+         opened). These act on whatever's on screen — there is no
+         specific target, so always pass target="current_media" (or
+         omit it; a placeholder is filled in automatically).
+
+         USE THESE for "pause/stop/resume/skip the ad on the video/song
+         that's playing IN THE BROWSER" — anything referring to media on
+         a webpage that's already open, most commonly a prior YouTube
+         step in the same conversation.
+
+         Do NOT use the apps tool's spotify_* actions for this — those
+         control the separate Spotify desktop application, not a video
+         playing in the browser. If the task doesn't mention Spotify by
+         name and a browser/YouTube step happened earlier, it's
+         browser/media_*, not apps/spotify_*.
+
        LOW-LEVEL ACTIONS (only when you need specific control):
        search_web → navigate → extract_text
        Use for: general open-web research where no specific site was
@@ -119,6 +142,13 @@ EXAMPLES OF CORRECT PLANS:
         — that text won't exist on the page. click_best_result reads the
         actual result titles and picks the closest match to the search
         query X.)
+
+  "pause/stop the song or video that's playing" (in the browser):
+    step 1: browser / media_pause / target="current_media"
+        (NOT apps / spotify_pause — that's a different app entirely.
+        Use browser/media_pause whenever the media in question is
+        playing on a webpage, e.g. a YouTube video opened earlier in
+        this conversation.)
 
 3. files — File and folder operations (pure Python)
    Actions: move_file, copy_file, rename_file, delete_file,
@@ -161,6 +191,12 @@ ROUTING RULES:
         when no specific site was named (general open-web search).
       - Opening native Windows apps → use windows_ui
       - Spotify control → use apps tool
+      - Pausing/resuming/skipping a video or song already playing on a
+        webpage (e.g. a YouTube video from an earlier step) → use
+        browser tool, media_play/media_pause/media_resume/media_skip_ads/
+        media_wait, target="current_media". This is NOT the same as
+        Spotify control — only use apps/spotify_* if the task explicitly
+        names Spotify or a prior step opened the Spotify app itself.
       - Notion tasks → use apps tool
       - Waiting/pausing for N seconds → ALWAYS tool=apps, action=wait
         (never browser/wait or windows_ui/wait — those don't exist)
@@ -601,7 +637,14 @@ class Brain:
                 model=PLANNER_MODEL,
                 contents=[prompt],
                 config=types.GenerateContentConfig(
-                    max_output_tokens=500,
+                    # 800, not 500: this produces one full Step object with
+                    # the same free-text fields (description,
+                    # expected_outcome) as the main planner, which budgets
+                    # 2000 tokens for potentially many such objects. 500 was
+                    # tight enough that a moderately verbose response could
+                    # get cut mid-string, producing a JSON parse failure
+                    # (observed 2026-07-02: "Unterminated string...").
+                    max_output_tokens=800,
                 )
             )
 

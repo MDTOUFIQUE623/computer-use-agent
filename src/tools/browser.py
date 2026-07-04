@@ -1743,15 +1743,34 @@ class MediaController:
             self.bt._ensure_started()
             if self.bt._page is None:
                 return ToolResult(success=False, message="Browser not open", error="NoBrowser", data={})
-            
-            is_paused = self.bt._page.evaluate('''() => { 
-                const v = document.querySelector("video"); 
-                if (v && v.paused) { v.play(); return true; }
-                return false;
+
+            # Check for a video element and its state in one pass, but
+            # keep "no video at all" distinguishable from "video found and
+            # already playing" — collapsing these (as before) meant a
+            # blank/wrong tab silently reported success instead of the
+            # genuine "nothing to act on here" failure it actually is.
+            result = self.bt._page.evaluate('''() => {
+                const v = document.querySelector("video");
+                if (!v) return {found: false, was_paused: false};
+                if (v.paused) { v.play(); return {found: true, was_paused: true}; }
+                return {found: true, was_paused: false};
             }''')
-            if is_paused:
-                return ToolResult(success=True, message="Video playback started", data={})
-            return ToolResult(success=True, message="Video already playing or not found", data={})
+
+            if not result.get("found"):
+                return ToolResult(
+                    success=False,
+                    message="No video found on the current page to play",
+                    error="NoVideoFound",
+                    data={"current_url": self.bt._page.url},
+                )
+
+            page_data = {
+                "current_url": self.bt._page.url,
+                "page_title":  self.bt._get_stable_title(),
+            }
+            if result.get("was_paused"):
+                return ToolResult(success=True, message="Video playback started", data=page_data)
+            return ToolResult(success=True, message="Video already playing", data=page_data)
         except Exception as e:
             return ToolResult(success=False, message=f"Failed to play video: {e}", error="MediaPlayFailed", data={})
 
@@ -1760,15 +1779,29 @@ class MediaController:
             self.bt._ensure_started()
             if self.bt._page is None:
                 return ToolResult(success=False, message="Browser not open", error="NoBrowser", data={})
-            
-            is_playing = self.bt._page.evaluate('''() => { 
-                const v = document.querySelector("video"); 
-                if (v && !v.paused) { v.pause(); return true; }
-                return false;
+
+            result = self.bt._page.evaluate('''() => {
+                const v = document.querySelector("video");
+                if (!v) return {found: false, was_playing: false};
+                if (!v.paused) { v.pause(); return {found: true, was_playing: true}; }
+                return {found: true, was_playing: false};
             }''')
-            if is_playing:
-                return ToolResult(success=True, message="Video paused", data={})
-            return ToolResult(success=True, message="Video already paused or not found", data={})
+
+            if not result.get("found"):
+                return ToolResult(
+                    success=False,
+                    message="No video found on the current page to pause",
+                    error="NoVideoFound",
+                    data={"current_url": self.bt._page.url},
+                )
+
+            page_data = {
+                "current_url": self.bt._page.url,
+                "page_title":  self.bt._get_stable_title(),
+            }
+            if result.get("was_playing"):
+                return ToolResult(success=True, message="Video paused", data=page_data)
+            return ToolResult(success=True, message="Video already paused", data=page_data)
         except Exception as e:
             return ToolResult(success=False, message=f"Failed to pause video: {e}", error="MediaPauseFailed", data={})
 
