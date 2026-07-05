@@ -111,6 +111,12 @@ AVAILABLE TOOLS AND ACTIONS:
          name and a browser/YouTube step happened earlier, it's
          browser/media_*, not apps/spotify_*.
 
+         Note: any plan containing one of these actions automatically
+         gets completion_policy forced to keep_open regardless of what
+         you set — pausing/resuming media means the tab is still in use,
+         not finished with. You don't need to set completion_policy
+         specially for these; it's handled for you.
+
        LOW-LEVEL ACTIONS (only when you need specific control):
        search_web → navigate → extract_text
        Use for: general open-web research where no specific site was
@@ -862,6 +868,19 @@ class Brain:
         "spotify_next", "screenshot", "wait",
     }
 
+    # Actions where the whole point is that media is still relevant to the
+    # browser session afterward — pausing/resuming/skipping an ad on a
+    # video is "hold on a second," not "I'm finished with this page."
+    # Forced deterministically rather than left to the LLM's judgment: we
+    # already saw the model drift on completion_policy once (the
+    # 2026-07-02 "user_decides" incident) purely from prompt wording, and
+    # this is a hard rule, not a preference — closing the tab right after
+    # a media-control action directly undoes the action's own purpose.
+    _MEDIA_CONTROL_ACTIONS = {
+        "media_play", "media_pause", "media_resume",
+        "media_skip_ads", "media_wait",
+    }
+
     # Maps values the model might emit that aren't in the current
     # CompletionPolicy enum onto the closest valid equivalent. This exists
     # because prompt wording alone can't fully constrain an LLM's enum
@@ -958,6 +977,18 @@ class Brain:
                 steps = steps,
                 notes = data.get("notes"),
             )
+
+            has_media_control_step = any(
+                step.action.value in self._MEDIA_CONTROL_ACTIONS
+                for step in plan.steps
+            )
+            if has_media_control_step and plan.completion_policy != "keep_open":
+                log.info(
+                    "Forcing completion_policy to keep_open — plan "
+                    "includes a media control action (was: %s)",
+                    plan.completion_policy,
+                )
+                plan.completion_policy = "keep_open"
 
             # Renumber steps after filtering
             for idx, step in enumerate(plan.steps):
