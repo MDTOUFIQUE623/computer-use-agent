@@ -354,10 +354,22 @@ def execute_node(state: GraphState) -> dict:
                 print(f"[EXEC] OCR captured {len(text.split())} word(s)")
 
         elif step.tool == ToolType.APPS:
-            content = data.get("content")
+            content  = data.get("content")
+            track    = data.get("track")
+            artist   = data.get("artist")
+            playlist = data.get("playlist")
+
             if content:
                 slots.clipboard_text = content
                 slots.last_text = content
+            elif track:
+                summary = f"Playing '{track}'" + (f" by {artist}" if artist else "")
+                slots.set_text("last_text", summary)
+                print(f"[EXEC] {summary}")
+            elif playlist:
+                summary = f"Playing playlist '{playlist}'"
+                slots.set_text("last_text", summary)
+                print(f"[EXEC] {summary}")
 
         elif step.tool == ToolType.VISION:
             description = (

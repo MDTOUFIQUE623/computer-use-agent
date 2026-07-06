@@ -12,9 +12,11 @@ from src.models import ToolResult
 from src.config import (
     SPOTIFY_CLIENT_ID,
     SPOTIFY_CLIENT_SECRET,
+    SPOTIFY_TOKEN_CACHE_PATH,
     NOTION_API_KEY,
     ACTION_COOLDOWN,
 )
+from src.tools.spotify_auth import SpotifyAuth
 
 log = logging.getLogger(__name__)
 
@@ -181,6 +183,13 @@ class SpotifyTools:
         Search for and open a playlist by name using Spotify's search.
         Uses keyboard shortcut Ctrl+L to focus search, then types query.
         Works without Web API credentials.
+
+        NOTE: this only searches — it does not confirm Spotify's window
+        actually has focus before sending keystrokes, so it can type into
+        the wrong window if Spotify isn't focused. Prefer
+        play_playlist_by_name() (Web API), which doesn't have this risk;
+        this method now exists mainly as its fallback when Web API auth
+        isn't set up.
         """
         start = time.monotonic()
         try:
@@ -211,6 +220,356 @@ class SpotifyTools:
                 error=str(e),
                 duration_ms=_ms(start)
             )
+
+    def _get_playback_device(self, headers: dict) -> tuple[Optional[str], Optional[str]]:
+        """
+        Find a device to play on: prefer the currently active one, else
+        the first available device (and activate it via transfer). This
+        exists because the single most common Web API playback failure
+        is "no active device" — Spotify has no concept of a session until
+        SOME device (desktop app, mobile, web player) is open somewhere.
+
+        Returns (device_id, error_message). error_message is None on success.
+        """
+        try:
+            response = requests.get(
+                "https://api.spotify.com/v1/me/player/devices",
+                headers=headers,
+                timeout=10,
+            )
+            response.raise_for_status()
+            devices = response.json().get("devices", [])
+        except Exception as e:
+            return None, f"Could not list Spotify devices: {e}"
+
+        if not devices:
+            return None, (
+                "No Spotify device found. Open Spotify (desktop app, "
+                "mobile, or web player) on any device first, then try again."
+            )
+
+        active = next((d for d in devices if d.get("is_active")), None)
+        if active:
+            return active["id"], None
+
+        # No active device — transfer playback to the first available one.
+        target = devices[0]
+        try:
+            requests.put(
+                "https://api.spotify.com/v1/me/player",
+                headers=headers,
+                json={"device_ids": [target["id"]], "play": False},
+                timeout=10,
+            )
+        except Exception as e:
+            return None, f"Could not activate Spotify device '{target.get('name')}': {e}"
+
+        return target["id"], None
+
+    def play_track(self, query: str) -> ToolResult:
+        """
+        Search the Spotify Web API for a track by name/query and start
+        playing it on an active (or newly-activated) device.
+        Requires SPOTIFY_CLIENT_ID/SECRET and completed OAuth authorization
+        — first call ever will open a browser for one-time consent unless
+        `python scripts/spotify_login.py` was already run.
+        """
+        start = time.monotonic()
+        auth  = SpotifyAuth()
+
+        if not auth.is_configured():
+            return ToolResult(
+                success=False,
+                message=(
+                    "Spotify isn't configured — add SPOTIFY_CLIENT_ID and "
+                    "SPOTIFY_CLIENT_SECRET to .env first"
+                ),
+                error="SpotifyNotConfigured",
+                duration_ms=_ms(start),
+            )
+
+        token = auth.get_valid_token()
+        if not token:
+            return ToolResult(
+                success=False,
+                message="Spotify authorization failed or was not completed",
+                error="SpotifyAuthFailed",
+                duration_ms=_ms(start),
+            )
+
+        headers = {"Authorization": f"Bearer {token}"}
+
+        try:
+            # DIAGNOSTIC (temporary — remove once the wrong-result issue
+            # from 2026-07-05 is root-caused): log the literal query
+            # value and raw top-3 results so we can see exactly what
+            # Spotify received and returned, rather than guessing.
+            log.info("play_track: searching Spotify for query=%r", query)
+
+            search_response = requests.get(
+                "https://api.spotify.com/v1/search",
+                headers=headers,
+                params={"q": query, "type": "track", "limit": 3},
+                timeout=10,
+            )
+            log.info(
+                "play_track: search HTTP status=%d, url=%s",
+                search_response.status_code, search_response.url,
+            )
+            search_response.raise_for_status()
+            all_items = search_response.json().get("tracks", {}).get("items", [])
+
+            for i, it in enumerate(all_items):
+                artists = ", ".join(a["name"] for a in it.get("artists", []))
+                log.info(
+                    "play_track: result[%d] = %r by %r (uri=%s)",
+                    i, it.get("name"), artists, it.get("uri"),
+                )
+
+            items = all_items[:1]
+
+            if not items:
+                return ToolResult(
+                    success=False,
+                    message=f"No Spotify track found for '{query}'",
+                    error="NoTrackFound",
+                    duration_ms=_ms(start),
+                )
+
+            track       = items[0]
+            track_uri   = track["uri"]
+            track_name  = track["name"]
+            artist_name = ", ".join(a["name"] for a in track.get("artists", []))
+
+            device_id, device_error = self._get_playback_device(headers)
+            if device_error:
+                return ToolResult(
+                    success=False,
+                    message=device_error,
+                    error="NoPlaybackDevice",
+                    data={"track": track_name, "artist": artist_name},
+                    duration_ms=_ms(start),
+                )
+
+            log.info(
+                "play_track: sending play request for uri=%s to device_id=%s",
+                track_uri, device_id,
+            )
+            play_response = requests.put(
+                "https://api.spotify.com/v1/me/player/play",
+                headers=headers,
+                params={"device_id": device_id},
+                json={"uris": [track_uri]},
+                timeout=10,
+            )
+            log.info(
+                "play_track: play HTTP status=%d, body=%r",
+                play_response.status_code, play_response.text[:300],
+            )
+
+            if play_response.status_code == 403:
+                return ToolResult(
+                    success=False,
+                    message="Spotify playback control requires a Premium account",
+                    error="PremiumRequired",
+                    duration_ms=_ms(start),
+                )
+            play_response.raise_for_status()
+
+            return ToolResult(
+                success=True,
+                message=f"Playing '{track_name}' by {artist_name} on Spotify",
+                data={
+                    "track":  track_name,
+                    "artist": artist_name,
+                    "uri":    track_uri,
+                },
+                duration_ms=_ms(start),
+            )
+
+        except requests.HTTPError as e:
+            log.error("play_track HTTP error: %s", e)
+            return ToolResult(
+                success=False,
+                message=f"Spotify API error while playing '{query}'",
+                error=str(e),
+                duration_ms=_ms(start),
+            )
+        except Exception as e:
+            log.error("play_track failed: %s", e)
+            return ToolResult(
+                success=False,
+                message=f"Failed to play '{query}' on Spotify",
+                error=str(e),
+                duration_ms=_ms(start),
+            )
+
+    def _find_own_playlist(self, headers: dict, name: str) -> Optional[dict]:
+        """
+        Look for a case-insensitive substring match against the user's
+        own playlist library (owned + followed, includes Spotify-generated
+        ones like Discover Weekly / Release Radar / Daily Mix). These
+        personalized/algorithmic playlists are frequently NOT returned by
+        the public /v1/search?type=playlist catalog endpoint at all — it
+        indexes public playlists, not each user's private generated ones
+        — so this has to be checked separately, not as an afterthought.
+
+        Only fetches the first 50 (one page). Good enough for the vast
+        majority of libraries; a user with 50+ playlists whose target
+        isn't in the first page falls through to public search same as
+        before.
+        """
+        try:
+            response = requests.get(
+                "https://api.spotify.com/v1/me/playlists",
+                headers=headers,
+                params={"limit": 50},
+                timeout=10,
+            )
+            if response.status_code == 403:
+                # This means the cached token was authorized before
+                # playlist-read-private was added to SPOTIFY_SCOPES.
+                # Spotify grants scopes at consent time — changing the
+                # scope list in config.py does NOT retroactively widen
+                # an already-issued refresh token. A one-time
+                # re-authorization is required.
+                log.warning(
+                    "Cannot read your Spotify playlist library (403 — "
+                    "insufficient scope). This means the cached Spotify "
+                    "token predates the playlist-read-private permission. "
+                    "Fix: delete %s and run 'python scripts/spotify_login.py' "
+                    "again to re-authorize with the correct scope. Falling "
+                    "back to public catalog search for now, which may find "
+                    "a different playlist with the same name.",
+                    SPOTIFY_TOKEN_CACHE_PATH,
+                )
+                return None
+            response.raise_for_status()
+            items = response.json().get("items", []) or []
+        except Exception as e:
+            log.warning("Could not fetch user's own playlists: %s", e)
+            return None
+
+        name_lower = name.lower()
+        for item in items:
+            if item and name_lower in (item.get("name") or "").lower():
+                return item
+        return None
+
+    def play_playlist_by_name(self, name: str) -> ToolResult:
+        """
+        Find a playlist by name and start playing it on an active (or
+        newly-activated) device. Checks the user's own library first
+        (catches Discover Weekly and similar personalized playlists the
+        public catalog search can't see), then falls back to public
+        catalog search, then to the legacy UI-typing method if Web API
+        credentials aren't configured or nothing is found.
+        """
+        start = time.monotonic()
+        auth  = SpotifyAuth()
+
+        if not auth.is_configured():
+            log.info(
+                "Spotify Web API not configured — falling back to "
+                "UI-based playlist search for '%s'", name,
+            )
+            return self.open_playlist_by_name(name)
+
+        token = auth.get_valid_token()
+        if not token:
+            log.warning(
+                "Spotify authorization unavailable — falling back to "
+                "UI-based playlist search for '%s'", name,
+            )
+            return self.open_playlist_by_name(name)
+
+        headers = {"Authorization": f"Bearer {token}"}
+
+        try:
+            playlist = self._find_own_playlist(headers, name)
+            source   = "library"
+
+            if not playlist:
+                search_response = requests.get(
+                    "https://api.spotify.com/v1/search",
+                    headers=headers,
+                    params={"q": name, "type": "playlist", "limit": 5},
+                    timeout=10,
+                )
+                search_response.raise_for_status()
+                raw_items = search_response.json().get("playlists", {}).get("items", []) or []
+
+                # Spotify's search endpoint is documented to sometimes
+                # return null entries in this list — filter them out
+                # instead of indexing blindly into item[0], which is
+                # exactly what crashed here (2026-07-06:
+                # "'NoneType' object is not subscriptable").
+                items = [it for it in raw_items if it]
+                if len(items) < len(raw_items):
+                    log.info(
+                        "play_playlist_by_name: search returned %d null "
+                        "entr%s out of %d total for '%s'",
+                        len(raw_items) - len(items),
+                        "y" if (len(raw_items) - len(items)) == 1 else "ies",
+                        len(raw_items), name,
+                    )
+
+                playlist = items[0] if items else None
+                source   = "search"
+
+            if not playlist:
+                log.info(
+                    "No playlist found for '%s' in library or public "
+                    "search — falling back to UI search", name,
+                )
+                return self.open_playlist_by_name(name)
+
+            playlist_uri  = playlist["uri"]
+            playlist_name = playlist["name"]
+            log.info(
+                "play_playlist_by_name: using '%s' (uri=%s) from %s",
+                playlist_name, playlist_uri, source,
+            )
+
+            device_id, device_error = self._get_playback_device(headers)
+            if device_error:
+                return ToolResult(
+                    success=False,
+                    message=device_error,
+                    error="NoPlaybackDevice",
+                    data={"playlist": playlist_name},
+                    duration_ms=_ms(start),
+                )
+
+            play_response = requests.put(
+                "https://api.spotify.com/v1/me/player/play",
+                headers=headers,
+                params={"device_id": device_id},
+                json={"context_uri": playlist_uri},
+                timeout=10,
+            )
+
+            if play_response.status_code == 403:
+                return ToolResult(
+                    success=False,
+                    message="Spotify playback control requires a Premium account",
+                    error="PremiumRequired",
+                    duration_ms=_ms(start),
+                )
+            play_response.raise_for_status()
+
+            return ToolResult(
+                success=True,
+                message=f"Playing playlist '{playlist_name}' on Spotify",
+                data={"playlist": playlist_name, "uri": playlist_uri},
+                duration_ms=_ms(start),
+            )
+
+        except Exception as e:
+            log.error(
+                "play_playlist_by_name failed (%s) — falling back to UI search", e
+            )
+            return self.open_playlist_by_name(name)
 
     def get_window_title(self) -> ToolResult:
         """
@@ -553,7 +912,7 @@ class SpotifyTools:
             return self.get_current_state()
 
         try:
-            token = self._get_access_token()
+            token = SpotifyAuth().get_valid_token()
             if not token:
                 return self.get_current_state()
 
@@ -1202,7 +1561,10 @@ def build_executor():
             ActionType.SPOTIFY_PLAY:     lambda: spotify.play(),
             ActionType.SPOTIFY_PAUSE:    lambda: spotify.pause(),
             ActionType.SPOTIFY_NEXT:     lambda: spotify.next_track(),
-            ActionType.SPOTIFY_PLAYLIST: lambda: spotify.open_playlist_by_name(
+            ActionType.SPOTIFY_PLAYLIST: lambda: spotify.play_playlist_by_name(
+                step.target
+            ),
+            ActionType.SPOTIFY_PLAY_TRACK: lambda: spotify.play_track(
                 step.target
             ),
             ActionType.CLIPBOARD_COPY:   lambda: system.copy_to_clipboard(
@@ -1236,4 +1598,3 @@ def build_executor():
         return handler()
  
     return ToolSpec(tool_type=_ToolType.APPS, executor=executor)
- 

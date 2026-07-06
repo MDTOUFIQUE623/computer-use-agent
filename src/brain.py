@@ -156,6 +156,13 @@ EXAMPLES OF CORRECT PLANS:
         playing on a webpage, e.g. a YouTube video opened earlier in
         this conversation.)
 
+  "play <song name> on spotify":
+    step 1: apps / spotify_play_track / target="<song name>"
+        (NOT browser/media_play, NOT spotify_play — spotify_play only
+        resumes whatever Spotify already has queued; it can't search
+        for and start a specific new song. spotify_play_track does the
+        search-and-play in one step.)
+
 3. files — File and folder operations (pure Python)
    Actions: move_file, copy_file, rename_file, delete_file,
             create_folder, list_files, find_files, organize_files,
@@ -163,9 +170,23 @@ EXAMPLES OF CORRECT PLANS:
 
 4. apps — App-specific integrations
        Actions: spotify_play, spotify_pause, spotify_next,
-                spotify_playlist, notion_create_page, notion_append,
-                clipboard_copy, clipboard_paste, volume_set, wait
- 
+                spotify_playlist, spotify_play_track, notion_create_page,
+                notion_append, clipboard_copy, clipboard_paste,
+                volume_set, wait
+
+       SPOTIFY ACTIONS — WHICH ONE TO USE:
+       spotify_play / spotify_pause / spotify_next: control whatever is
+         ALREADY queued/playing (resume, pause, skip). No target needed.
+       spotify_play_track(target="<song name>"): search Spotify and
+         start playing a SPECIFIC named song. Use this for "play <song>
+         on Spotify" — spotify_play alone cannot do this, it only
+         resumes an existing queue.
+       spotify_playlist(target="<playlist name>"): search Spotify and
+         start playing a SPECIFIC named playlist.
+       Both spotify_play_track and spotify_playlist search Spotify's
+       real catalog via its API — put the actual song/playlist name in
+       target, not a description.
+
        NOTE: "wait" (pausing for N seconds) is ALWAYS tool=apps,
        action=wait, value="<seconds>" — even in the middle of a browser
        or windows_ui sequence. There is no browser/wait or windows_ui/wait
@@ -196,7 +217,10 @@ ROUTING RULES:
         THEN use search_on_page, NOT search_web. Only use search_web
         when no specific site was named (general open-web search).
       - Opening native Windows apps → use windows_ui
-      - Spotify control → use apps tool
+      - Spotify control (play/pause/next, or playing a SPECIFIC named
+        song/playlist) → use apps tool. "Play <song> on Spotify" →
+        spotify_play_track, target=<song name>. "Play <playlist> on
+        Spotify" → spotify_playlist, target=<playlist name>.
       - Pausing/resuming/skipping a video or song already playing on a
         webpage (e.g. a YouTube video from an earlier step) → use
         browser tool, media_play/media_pause/media_resume/media_skip_ads/
@@ -325,7 +349,7 @@ CRITICAL: Only use these exact action values:
     navigate, search_web, search_on_page, click_element, click_best_result, fill_form, extract_text, wait_for_page,
     get_first_result, move_file, copy_file, rename_file, delete_file, create_folder, list_files,
     find_files, organize_files, write_file, spotify_play, spotify_pause, spotify_next,
-    spotify_playlist, notion_create_page, notion_append, clipboard_copy,
+    spotify_playlist, spotify_play_track, notion_create_page, notion_append, clipboard_copy,
     clipboard_paste, volume_set, wait, screenshot, media_play, media_pause, media_resume, media_skip_ads, media_wait
 
 - Never invent action names. Never use: respond, display, show, open_url, type.

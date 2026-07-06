@@ -97,6 +97,29 @@ pyautogui.PAUSE    = 0.4    # small pause after every pyautogui call
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 
+# Phase 4 — Spotify Web API playback (OAuth Authorization Code flow).
+# Must exactly match a Redirect URI registered on the app's Spotify
+# Developer Dashboard page, or the authorization exchange will fail.
+SPOTIFY_REDIRECT_URI = os.getenv(
+    "SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback"
+)
+# Scopes needed for read (now-playing) + write (play/pause/transfer)
+# access, plus reading the user's own playlist library (needed to find
+# personalized/algorithmic playlists like Discover Weekly, which the
+# public catalog search generally can't see — see _find_own_playlist).
+# Space-separated per Spotify's spec.
+SPOTIFY_SCOPES = os.getenv(
+    "SPOTIFY_SCOPES",
+    "user-read-playback-state user-modify-playback-state "
+    "user-read-currently-playing playlist-read-private "
+    "playlist-read-collaborative",
+)
+# Local cache for the OAuth refresh token, so the interactive browser
+# consent step only ever needs to happen once. Not committed to git
+# (add to .gitignore) — it's equivalent to a password for this app's
+# access to the user's Spotify account.
+SPOTIFY_TOKEN_CACHE_PATH = str(BASE_DIR / "spotify_token_cache.json")
+
 # Notion API
 NOTION_API_KEY = os.getenv("NOTION_API_KEY", "")
 

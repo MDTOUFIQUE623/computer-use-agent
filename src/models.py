@@ -81,6 +81,10 @@ class ActionType(str, Enum):
     SPOTIFY_PAUSE    = "spotify_pause"
     SPOTIFY_NEXT     = "spotify_next"
     SPOTIFY_PLAYLIST = "spotify_playlist"
+    # Phase 4: search-and-play a specific track by name via the Web API.
+    # Distinct from SPOTIFY_PLAY (which only resumes whatever's already
+    # queued) — nothing before this could play an arbitrary named song.
+    SPOTIFY_PLAY_TRACK = "spotify_play_track"
     NOTION_CREATE    = "notion_create_page"
     NOTION_APPEND    = "notion_append"
 
