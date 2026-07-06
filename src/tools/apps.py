@@ -445,7 +445,27 @@ class SpotifyTools:
                 )
                 return None
             response.raise_for_status()
-            items = response.json().get("items", []) or []
+            payload = response.json()
+            items   = payload.get("items", []) or []
+            total   = payload.get("total")
+
+            # DIAGNOSTIC (temporary — remove once the Discover Weekly
+            # library-match miss from 2026-07-06 is root-caused): log
+            # exactly what came back so we know whether the target
+            # simply isn't in this account's /v1/me/playlists response,
+            # or is present but not matching for some other reason
+            # (naming, pagination beyond the 50-item page, etc.).
+            log.info(
+                "_find_own_playlist: fetched %d item(s), API reports "
+                "total=%s, looking for %r",
+                len(items), total, name,
+            )
+            for i, it in enumerate(items):
+                if it:
+                    log.info("_find_own_playlist: item[%d] = %r", i, it.get("name"))
+                else:
+                    log.info("_find_own_playlist: item[%d] = null", i)
+
         except Exception as e:
             log.warning("Could not fetch user's own playlists: %s", e)
             return None
