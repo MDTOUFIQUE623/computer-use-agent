@@ -631,7 +631,14 @@ def complete_node(state: GraphState) -> dict:
     if policy == "auto_close":
         _close_browser_instance()
     elif policy == "keep_open":
-        print("\n[LIFECYCLE] Leaving browser open — task result is meant to stay visible.")
+        # Only meaningful if a browser was actually opened for this task.
+        # A pure apps-tool plan (e.g. Spotify playback) never touches
+        # _browser_instance at all — printing "leaving browser open" for
+        # a task that never opened one is confusing, not just harmless
+        # (observed 2026-07-06: a pure spotify_playlist task printed this
+        # despite src.graph never having attached to Chrome).
+        if _browser_instance is not None:
+            print("\n[LIFECYCLE] Leaving browser open — task result is meant to stay visible.")
     elif policy == "ask_user":
         print("\n[ACTION NEEDED]\nEverything is ready. Would you like me to keep the browser open? (leaving it open for now)")
     else:
@@ -660,7 +667,8 @@ def failed_node(state: GraphState) -> dict:
     if policy == "auto_close":
         _close_browser_instance()
     elif policy == "keep_open":
-        print("\n[LIFECYCLE] Leaving browser open despite failure — you may want to inspect the page.")
+        if _browser_instance is not None:
+            print("\n[LIFECYCLE] Leaving browser open despite failure — you may want to inspect the page.")
     elif policy == "ask_user":
         print("\n[ACTION NEEDED]\nTask failed. Would you like me to keep the browser open? (leaving it open for now)")
     else:

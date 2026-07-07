@@ -1554,6 +1554,39 @@ class SystemTools:
             message=f"Waited {seconds}s",
             duration_ms=_ms(start)
         )
+
+    def take_screenshot(self, save_path: Optional[str] = None) -> ToolResult:
+        """
+        Capture a full-screen screenshot to disk.
+
+        Was previously listed in the planner prompt's apps-tool action
+        catalogue and referenced in verifier.py's no-verification-needed
+        list, but had no executor wired to it at all — any plan step
+        using it would have crashed with "Unknown apps action:
+        screenshot" the first time the LLM happened to plan one, the
+        exact same class of gap found for media_pause earlier. Found via
+        a full ActionType-to-executor cross-check, 2026-07-06.
+        """
+        start = time.monotonic()
+        try:
+            path = save_path or f"screenshot_{int(time.time())}.png"
+            image = pyautogui.screenshot()
+            image.save(path)
+
+            return ToolResult(
+                success=True,
+                message=f"Screenshot saved to '{path}'",
+                data={"path": path},
+                duration_ms=_ms(start),
+            )
+        except Exception as e:
+            log.error("take_screenshot failed: %s", e)
+            return ToolResult(
+                success=False,
+                message="Failed to take screenshot",
+                error=str(e),
+                duration_ms=_ms(start),
+            )
     
     
 
@@ -1597,6 +1630,7 @@ def build_executor():
             ActionType.WAIT:             lambda: system.wait_seconds(
                 float(step.value or "1")
             ),
+            ActionType.SCREENSHOT:       lambda: system.take_screenshot(),
             ActionType.NOTION_CREATE:    lambda: notion.create_page(
                 parent_page_id=step.target,
                 title=step.value or "New Page",

@@ -125,14 +125,25 @@ def _route_verification(
     if action in (ActionType.WAIT, ActionType.SCREENSHOT, ActionType.VOLUME_SET):
         return VerificationStatus.SUCCESS, "Action type does not require verification"
 
-    # After the existing action checks, add:
+    # Simple transport controls have no meaningful data to check beyond
+    # "the API call didn't error" (tool_result.success already gated
+    # this in verify_step's Step 1) — nothing more to verify here.
     if action in (
         ActionType.SPOTIFY_PLAY,
         ActionType.SPOTIFY_PAUSE,
         ActionType.SPOTIFY_NEXT,
-        ActionType.SPOTIFY_PLAYLIST,
     ):
         return VerificationStatus.SUCCESS, "Spotify action completed"
+
+    # play_track / play_playlist DO return meaningful data (track/artist
+    # or playlist name) — check for it rather than blindly trusting
+    # success, same reasoning as click_best_result's dedicated verifier.
+    # Added 2026-07-06: SPOTIFY_PLAY_TRACK was previously missing from
+    # the blind-trust list entirely (fell through to generic UNCERTAIN),
+    # while SPOTIFY_PLAYLIST got blind SUCCESS with no data check at all
+    # — inconsistent treatment for two actions with identical data shape.
+    if action in (ActionType.SPOTIFY_PLAY_TRACK, ActionType.SPOTIFY_PLAYLIST):
+        return _verify_spotify_playback(tool_result)
 
     # --- fallback: uncertain but not failed ---
     log.debug(
@@ -355,6 +366,41 @@ def _verify_click_best_result(
         return VerificationStatus.SUCCESS, f"Navigated to '{page_title}' at {current_url}"
 
     return VerificationStatus.UNCERTAIN, "Could not verify click_best_result"
+
+
+def _verify_spotify_playback(
+    tool_result: ToolResult,
+) -> tuple[VerificationStatus, str]:
+    """
+    Verify a spotify_play_track / spotify_playlist result by checking
+    the data it actually returned, rather than blindly trusting success.
+    We don't query live Spotify playback state here (that would need
+    another API round-trip and its own auth handling) — this checks
+    that the tool's own response contains what it claims to have played.
+    """
+    if not tool_result.success:
+        return VerificationStatus.FAILED, f"Tool reported failure: {tool_result.error or tool_result.message}"
+
+    data     = tool_result.data or {}
+    track    = data.get("track")
+    artist   = data.get("artist")
+    playlist = data.get("playlist")
+
+    if track:
+        detail = f"'{track}'" + (f" by {artist}" if artist else "")
+        return VerificationStatus.SUCCESS, f"Verified Spotify is playing {detail}"
+
+    if playlist:
+        return VerificationStatus.SUCCESS, f"Verified Spotify is playing playlist '{playlist}'"
+
+    # Tool reported success but didn't include the data we'd expect —
+    # possible if a future code path returns success without populating
+    # these fields. Not a failure (the API call itself didn't error),
+    # but not confidently verified either.
+    return (
+        VerificationStatus.UNCERTAIN,
+        "Spotify reported success but no track/playlist name in response",
+    )
 
 
 def _verify_text_typed(

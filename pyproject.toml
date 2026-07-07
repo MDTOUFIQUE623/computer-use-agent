@@ -16,6 +16,7 @@ dependencies = [
     "pytesseract>=0.3.10",
     "python-dotenv>=1.2.2",
     "pywin32>=306",
+    "requests>=2.31.0",
     "uiautomation>=2.0.18",
 ]
 

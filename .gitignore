@@ -13,3 +13,8 @@ wheels/
 # Logs (project)
 logs/
 *.log
+
+# Phase 4: Spotify OAuth refresh token cache — functionally equivalent
+# to a password for this app's access to the user's Spotify account.
+# Never commit this.
+spotify_token_cache.json
