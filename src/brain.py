@@ -38,22 +38,51 @@ AVAILABLE TOOLS AND ACTIONS:
 
 2. browser — Browser automation via Playwright
        Actions: navigate, search_web, search_on_page, click_element,
-                fill_form, extract_text, wait_for_page, get_first_result,
-                search_and_extract, search_extract_and_summarize,
-                media_play, media_pause, media_resume, media_skip_ads,
-                media_wait
- 
+                fill_form, extract_text, extract_and_summarize,
+                wait_for_page, get_first_result, search_and_extract,
+                search_extract_and_summarize, media_play, media_pause,
+                media_resume, media_skip_ads, media_wait
+
        HIGH-LEVEL ACTIONS (prefer these):
        search_and_extract(target=query):
          Searches, finds best result, navigates to it, extracts clean text.
          Use for: "find information about X and save to file"
- 
+
        search_extract_and_summarize(target=query, value=topic_focus):
          Same as above but also summarizes with Gemini.
          Use for: "research X and give me a summary" or
-                  "find X and save a readable summary to file"
+                  "find X and save a readable summary to file" — single
+         TOPIC/CONCEPT questions where one good external source is the
+         right answer (a how-it-works question, a "what is X" question,
+         an article to read).
+
+         Do NOT use this for local-business or listing/comparison tasks
+         (cafes, restaurants, products, "near me" searches) — see
+         extract_and_summarize below instead. Corrected 2026-07-07: an
+         earlier version of this guidance pointed comparison/rating
+         tasks here, but navigating to one followed external page
+         throws away the OTHER candidates and their ratings that were
+         already visible in the search results themselves — a "cafes
+         with rating above 4.5" task ended up on a single blog post
+         with zero ratings on it at all, having abandoned the DuckDuckGo
+         results page that had Tripadvisor/Zomato rating snippets for
+         several cafes sitting right there.
+
+       extract_and_summarize(target=selector_or_none, value=topic_focus):
+         Summarizes/filters the CURRENT page IN PLACE — no navigation
+         away from it. Use this — after search_web, NOT after
+         search_extract_and_summarize's own internal navigation — for
+         any "find/list X matching criterion Y" task: local businesses,
+         products, listings, anything where the search RESULTS page
+         itself already shows multiple candidates with the comparable
+         attribute (rating, price, review count) in each result's
+         snippet. Put the criterion in value.
+           step 1: browser / search_web / target="<what to search for>"
+           step 2: browser / extract_and_summarize / value="<criterion>"
+         This keeps all the candidates from the results page in view
+         for the filter to actually work across, instead of narrowing
+         to one single external site that may not even have the data.
  
-       SITE-NATIVE SEARCH — CRITICAL ROUTING RULE:
        search_on_page(target=query):
          Uses the search box ALREADY ON the current page instead of
          leaving for an external search engine. Fills the box and
@@ -240,7 +269,8 @@ PASSING CONTENT BETWEEN STEPS:
   the matching tool action:
  
     {{browser_text}}    - text extracted by browser/extract_text,
-                           search_and_extract, search_extract_and_summarize
+                           search_and_extract, search_extract_and_summarize,
+                           extract_and_summarize
     {{browser_url}}      - URL from browser/navigate, search_web,
                            get_first_result
     {{ocr_text}}         - text read by ocr/read_window_text style actions
@@ -272,6 +302,23 @@ EXAMPLES OF CORRECT PLANS:
   "search for X online":
     step 1: browser / search_web / target="X"
     step 2: browser / extract_text / target="body"
+
+  "search for cafes in Jayanagar with rating above 4.5"
+  (any local-listing search with a filter/comparison criterion):
+    step 1: browser / search_web / target="cafes in Jayanagar"
+    step 2: browser / extract_and_summarize / value="rating above 4.5"
+        (NOT search_web + extract_text alone — that returns raw page
+        text with no filtering. NOT search_extract_and_summarize either
+        — that navigates to ONE followed external page, which can
+        easily have zero rating data of its own even though the search
+        RESULTS page it abandoned already showed several candidates
+        with Tripadvisor/Zomato-style rating snippets. Observed
+        2026-07-07 with both wrong variants: raw extract gave an
+        unfiltered dump including a 3.7-rated cafe; navigating to a
+        single blog post gave "no ratings available in this source."
+        Staying on the search results page and summarizing THAT with
+        the criterion as focus is what actually works, since that page
+        is where the multiple comparable candidates already are.)
 
   "create folder X on Desktop":
     step 1: files / create_folder / target="<full Desktop path>"
@@ -319,6 +366,16 @@ Rules:
 - File operations never need UI tools — use the files tool directly
 - Web research: use browser / search_web then browser / extract_text
   Do NOT add wait_for_page steps — search_web already waits for load
+  EXCEPTION: if the task has a filter/comparison criterion (rating
+  threshold, price limit, "top N", "best/cheapest") — typically local
+  business/listing searches — use browser / search_web then browser /
+  extract_and_summarize (with the criterion as value), NOT
+  search_extract_and_summarize. extract_text can't filter results at
+  all; search_extract_and_summarize navigates away to one external page
+  and can lose the comparison data across candidates that was already
+  visible on the search results page itself. Reserve
+  search_extract_and_summarize for single-topic research questions,
+  not listings.
 - Always set expected_outcome — this is how the verifier checks success
 - Set fallback_tool when a step might fail on the primary tool
 - Set requires_verification=false only for wait and volume actions
@@ -346,7 +403,8 @@ Rules:
 
 CRITICAL: Only use these exact action values:
     open_app, close_app, focus_app, click, type_text, press_key, scroll, select,
-    navigate, search_web, search_on_page, click_element, click_best_result, fill_form, extract_text, wait_for_page,
+    navigate, search_web, search_on_page, click_element, click_best_result, fill_form, extract_text,
+    extract_and_summarize, search_and_extract, search_extract_and_summarize, wait_for_page,
     get_first_result, move_file, copy_file, rename_file, delete_file, create_folder, list_files,
     find_files, organize_files, write_file, spotify_play, spotify_pause, spotify_next,
     spotify_playlist, spotify_play_track, notion_create_page, notion_append, clipboard_copy,
@@ -703,8 +761,9 @@ class Brain:
             # step legitimately has no target, and this check used to
             # discard it, making retries for those actions silently fail.
             if not data.get("target"):
-                if data.get("action") in self._TARGETLESS_ACTIONS:
-                    data["target"] = "current_media"
+                action = data.get("action")
+                if action in self._TARGETLESS_ACTIONS:
+                    data["target"] = self._placeholder_target_for(action)
                 else:
                     log.warning("Replan returned no target")
                     return None
@@ -890,7 +949,33 @@ class Brain:
         "media_play", "media_pause", "media_resume",
         "media_skip_ads", "media_wait",
         "spotify_next", "screenshot", "wait",
+        # Added 2026-07-07: extract_and_summarize's target (selector) is
+        # optional by design — it summarizes the current page as a whole
+        # when omitted. The prompt guidance for this action explicitly
+        # shows "target=selector_or_none", but nobody connected that to
+        # this gate when the action was added, so the very first time
+        # the LLM correctly omitted target, the step was silently
+        # dropped — identical failure mode to the original media_pause
+        # incident, just for a different action.
+        "extract_and_summarize",
     }
+
+    @staticmethod
+    def _placeholder_target_for(action: str) -> str:
+        """
+        Give each target-less action a placeholder that's actually safe
+        for its own executor, not one universal string. "current_media"
+        is meaningless for extract_and_summarize — worse, it's actively
+        wrong: build_executor's selector logic only treats "body",
+        "page", or "all" as "no selector" and passes anything else
+        through as a literal CSS selector, so extract_and_summarize
+        would get "current_media" as a bogus selector, fail to match,
+        and print a spurious "Selector not found" warning on every
+        single use before falling back to full-page extraction anyway.
+        """
+        if action == "extract_and_summarize":
+            return "page"
+        return "current_media"
 
     # Actions where the whole point is that media is still relevant to the
     # browser session afterward — pausing/resuming/skipping an ad on a
@@ -950,13 +1035,13 @@ class Brain:
 
                     # Skip steps with None or missing target — UNLESS the
                     # action is one of the target-less ones above, in which
-                    # case default to a short descriptive placeholder. The
-                    # placeholder is never read by any executor for these
-                    # actions; it exists purely so Step.target (a required
-                    # str field) has something readable to print in logs.
+                    # case default to a placeholder appropriate for that
+                    # specific action's executor (see
+                    # _placeholder_target_for — "current_media" is wrong
+                    # for extract_and_summarize specifically).
                     if not step_data.get("target"):
                         if is_targetless:
-                            step_data["target"] = "current_media"
+                            step_data["target"] = self._placeholder_target_for(action_str)
                         else:
                             log.warning(
                                 "Skipping step %d: missing target", i + 1

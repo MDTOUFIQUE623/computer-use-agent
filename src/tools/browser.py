@@ -1906,6 +1906,10 @@ def build_executor():
             ActionType.EXTRACT_TEXT:      lambda: bt.extract_page_text(
                 selector=target if target not in ("body", "page", "all") else None
             ),
+            ActionType.EXTRACT_AND_SUMMARIZE: lambda: bt.extract_and_summarize(
+                selector=target if target not in ("body", "page", "all") else None,
+                topic=step.value,
+            ),
             ActionType.SEARCH_AND_EXTRACT: lambda: bt.search_and_extract(target),
             ActionType.SEARCH_EXTRACT_AND_SUMMARIZE: lambda: bt.search_extract_and_summarize(
                 target, step.value

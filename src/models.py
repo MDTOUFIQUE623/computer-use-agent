@@ -57,6 +57,16 @@ class ActionType(str, Enum):
     GET_FIRST_RESULT = "get_first_result"
     SEARCH_AND_EXTRACT          = "search_and_extract"
     SEARCH_EXTRACT_AND_SUMMARIZE = "search_extract_and_summarize"
+    # Summarizes/filters the CURRENT page in place — no navigation.
+    # Distinct from SEARCH_EXTRACT_AND_SUMMARIZE, which follows a link
+    # to one external page first. Was previously implemented
+    # (BrowserTools.extract_and_summarize) but had no ActionType wired
+    # to it at all — same orphaned-method gap as SCREENSHOT. Needed for
+    # "filter results ON the search page" tasks (e.g. local business
+    # listings with a rating/price criterion), where following a link
+    # to one external article often loses the comparison data that was
+    # already visible across multiple results on the search page itself.
+    EXTRACT_AND_SUMMARIZE = "extract_and_summarize"
     
     # Media Controller (Browser)
     MEDIA_PLAY       = "media_play"
