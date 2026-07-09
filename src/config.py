@@ -85,6 +85,42 @@ SIMILAR_TASK_THRESHOLD = 0.70
 MAX_MEMORY_HINTS = 3
 FAILURE_THRESHOLD = 2
 
+# ---------------------------------------------------------------------------
+# Phase 5 — Vector Memory
+# ---------------------------------------------------------------------------
+#
+# MEMORY_SIMILARITY_BACKEND controls how memory.py compares task descriptions
+# for "find similar past task" lookups.
+#
+#   "embedding" (default) — Use Gemini's embed_content endpoint. Two tasks
+#             phrased completely differently ("grab today's headlines" vs
+#             "check the news") but semantically the same will now match.
+#             Falls back to "sequence" automatically, per-call, if the
+#             embedding API is unreachable (no key, no network, rate limit).
+#
+#   "sequence" — The original Phase 1-4 behavior: difflib.SequenceMatcher
+#             string-similarity only. No network calls. Useful if you want
+#             fully offline memory or want to disable embedding spend.
+#
+MEMORY_SIMILARITY_BACKEND: str = os.getenv("MEMORY_SIMILARITY_BACKEND", "embedding")
+
+# gemini-embedding-001 supports Matryoshka truncation down to smaller
+# dimensions with minimal quality loss (per Google's MRL training) — 768
+# keeps each stored vector small (~3KB as JSON) while still comfortably
+# beating SequenceMatcher on semantic matches. Bump toward 1536/3072 if
+# you have a large memory.db and want higher recall.
+EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
+EMBEDDING_DIMENSIONALITY: int = int(os.getenv("EMBEDDING_DIMENSIONALITY", "768"))
+
+# Cosine similarity threshold for the embedding backend. NOT the same scale
+# as SIMILAR_TASK_THRESHOLD (SequenceMatcher ratio) — cosine similarity
+# between two related-but-differently-worded sentences typically lands
+# ~0.55-0.75, whereas SequenceMatcher needs near-identical wording to hit
+# 0.70. Tune independently.
+EMBEDDING_SIMILARITY_THRESHOLD: float = float(
+    os.getenv("EMBEDDING_SIMILARITY_THRESHOLD", "0.55")
+)
+
 # Screenshot (vision fallback only)
 SCREENSHOT_WIDTH = 1280
 

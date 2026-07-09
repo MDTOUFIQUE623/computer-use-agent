@@ -1,6 +1,8 @@
 import sqlite3
 import json
 import logging
+import math
+import threading
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from contextlib import contextmanager
@@ -11,6 +13,10 @@ from src.config import (
     SIMILAR_TASK_THRESHOLD,
     MAX_MEMORY_HINTS,
     FAILURE_THRESHOLD,
+    MEMORY_SIMILARITY_BACKEND,
+    EMBEDDING_MODEL,
+    EMBEDDING_DIMENSIONALITY,
+    EMBEDDING_SIMILARITY_THRESHOLD,
 )
 from src.models import (
     TaskPattern,
@@ -78,19 +84,154 @@ def init_db() -> None:
                 discovered_at TEXT NOT NULL
             );
         """)
+
+        # --- Phase 5 migration: add embedding column to pre-existing DBs ---
+        # SQLite has no "ADD COLUMN IF NOT EXISTS", so check PRAGMA first.
+        # NULL for any row saved before Phase 5 (or saved while the
+        # embedding API was unreachable) — those rows are backfilled
+        # opportunistically the next time they're compared against, see
+        # _get_row_embedding(), or all at once via backfill_all_embeddings().
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_patterns)")}
+        if "embedding" not in cols:
+            conn.execute("ALTER TABLE task_patterns ADD COLUMN embedding TEXT")
+            log.info("Migrated task_patterns: added embedding column (Phase 5)")
+
     log.info("Memory DB initialised at %s", MEMORY_DB_PATH)
 
 
 # ---------------------------------------------------------------------------
-# Similarity helper
+# Similarity helpers
 # ---------------------------------------------------------------------------
 
 def _similarity(a: str, b: str) -> float:
     """
-    Simple text similarity using SequenceMatcher (0.0 – 1.0).
-    Good enough for task description matching without heavy dependencies.
+    Simple text similarity using SequenceMatcher (0.0 - 1.0).
+    This is the Phase 1-4 backend. Still used as:
+      (a) the whole-call fallback if the embedding API is unreachable, and
+      (b) the per-row fallback for a legacy row whose embedding backfill
+          itself just failed (e.g. API down at that exact moment).
     """
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+# --- Phase 5: embedding backend -------------------------------------------
+#
+# One genai client for embeddings, created lazily so importing this module
+# never requires GEMINI_API_KEY to be set (e.g. running with
+# MEMORY_SIMILARITY_BACKEND=sequence, or in tests).
+
+_embed_client = None
+_embed_client_lock = threading.Lock()
+
+# Process-lifetime cache: the same task_description gets embedded once on
+# save and then again on every future similarity check, so avoid re-paying
+# the API call for text we've already embedded this run.
+_embedding_cache: dict[str, list[float]] = {}
+
+
+def _get_embed_client():
+    global _embed_client
+    if _embed_client is None:
+        with _embed_client_lock:
+            if _embed_client is None:
+                from google import genai
+                _embed_client = genai.Client()
+    return _embed_client
+
+
+def _embed_text(text: str) -> Optional[list[float]]:
+    """
+    Return an embedding vector for `text`, or None if the embedding backend
+    is disabled or unavailable right now (missing API key, network error,
+    rate limit, etc). Callers must treat None as "fall back to
+    SequenceMatcher for this comparison" rather than raising — memory is a
+    nice-to-have hint for Brain, never something that should block a task.
+    """
+    if MEMORY_SIMILARITY_BACKEND != "embedding":
+        return None
+
+    if text in _embedding_cache:
+        return _embedding_cache[text]
+
+    try:
+        from google.genai import types
+        client = _get_embed_client()
+        result = client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=text,
+            config=types.EmbedContentConfig(
+                output_dimensionality=EMBEDDING_DIMENSIONALITY
+            ),
+        )
+        vector = list(result.embeddings[0].values)
+        _embedding_cache[text] = vector
+        return vector
+    except Exception as e:
+        log.warning(
+            "Embedding call failed (%s) - falling back to SequenceMatcher "
+            "for this comparison", e
+        )
+        return None
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Pure-python cosine similarity - no numpy needed for 768-dim vectors."""
+    dot     = sum(x * y for x, y in zip(a, b))
+    norm_a  = math.sqrt(sum(x * x for x in a))
+    norm_b  = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _get_row_embedding(row: sqlite3.Row) -> Optional[list[float]]:
+    """
+    Return the stored embedding for a task_patterns row, backfilling it
+    (and persisting the backfill) if the row predates Phase 5 or was saved
+    while the embedding API was down. Self-healing - no separate one-off
+    migration script needed for the common case, though
+    scripts/backfill_embeddings.py exists for bulk-backfilling a large
+    existing memory.db in one pass instead of one row at a time.
+    """
+    raw = row["embedding"] if "embedding" in row.keys() else None
+    if raw:
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            log.warning("Corrupt embedding for pattern id=%s, re-embedding", row["id"])
+
+    vector = _embed_text(row["task_description"])
+    if vector is not None:
+        with _get_conn() as conn:
+            conn.execute(
+                "UPDATE task_patterns SET embedding = ? WHERE id = ?",
+                (json.dumps(vector), row["id"]),
+            )
+        log.debug("Backfilled embedding for pattern id=%s", row["id"])
+    return vector
+
+
+def _score_row(
+    query_text: str,
+    query_embedding: Optional[list[float]],
+    row: sqlite3.Row,
+) -> tuple[float, float]:
+    """
+    Score one row against the query. Returns (score, threshold) in
+    whichever scale actually produced the score - cosine similarity if
+    both sides have an embedding, SequenceMatcher ratio otherwise. The two
+    scales aren't directly comparable in absolute terms, so callers should
+    rank by margin (score - threshold), not raw score.
+    """
+    if query_embedding is not None:
+        row_embedding = _get_row_embedding(row)
+        if row_embedding is not None:
+            return (
+                _cosine_similarity(query_embedding, row_embedding),
+                EMBEDDING_SIMILARITY_THRESHOLD,
+            )
+
+    return _similarity(query_text, row["task_description"]), SIMILAR_TASK_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +246,12 @@ def save_task_pattern(pattern: TaskPattern) -> None:
     """
     existing = _find_similar_pattern(pattern.task_description)
 
+    # Embed once up front so both the UPDATE and INSERT paths below have it.
+    # None if the backend is disabled/unreachable — stored as NULL and
+    # backfilled later by _get_row_embedding() when it's next compared.
+    embedding = _embed_text(pattern.task_description)
+    embedding_json = json.dumps(embedding) if embedding is not None else None
+
     with _get_conn() as conn:
         if existing:
             # Update success rate as a rolling average
@@ -114,10 +261,11 @@ def save_task_pattern(pattern: TaskPattern) -> None:
                 UPDATE task_patterns
                 SET success_rate   = ?,
                     last_used      = ?,
-                    avg_duration_ms = ?
+                    avg_duration_ms = ?,
+                    embedding      = COALESCE(?, embedding)
                 WHERE id = ?
                 """,
-                (new_rate, pattern.last_used, pattern.avg_duration_ms, existing["id"]),
+                (new_rate, pattern.last_used, pattern.avg_duration_ms, embedding_json, existing["id"]),
             )
             log.debug("Updated existing pattern id=%s", existing["id"])
         else:
@@ -125,8 +273,9 @@ def save_task_pattern(pattern: TaskPattern) -> None:
                 """
                 INSERT INTO task_patterns
                     (task_description, tool_sequence, action_sequence,
-                     apps_involved, success_rate, last_used, avg_duration_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                     apps_involved, success_rate, last_used, avg_duration_ms,
+                     embedding)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     pattern.task_description,
@@ -136,6 +285,7 @@ def save_task_pattern(pattern: TaskPattern) -> None:
                     pattern.success_rate,
                     pattern.last_used,
                     pattern.avg_duration_ms,
+                    embedding_json,
                 ),
             )
             log.debug("Saved new task pattern: %s", pattern.task_description)
@@ -147,25 +297,26 @@ def save_task_pattern(pattern: TaskPattern) -> None:
 
 def _find_similar_pattern(task_description: str) -> Optional[sqlite3.Row]:
     """
-    Internal: return the single most-similar row above threshold, or None.
+    Internal: return the single most-similar row above its threshold, or None.
     """
+    query_embedding = _embed_text(task_description)
+
     with _get_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM task_patterns ORDER BY last_used DESC"
         ).fetchall()
 
-    best_row   = None
-    best_score = 0.0
+    best_row    = None
+    best_margin = 0.0  # score - threshold; must be >= 0 to count as a match
 
     for row in rows:
-        score = _similarity(task_description, row["task_description"])
-        if score > best_score:
-            best_score = score
-            best_row   = row
+        score, threshold = _score_row(task_description, query_embedding, row)
+        margin = score - threshold
+        if margin >= 0 and (best_row is None or margin > best_margin):
+            best_margin = margin
+            best_row    = row
 
-    if best_score >= SIMILAR_TASK_THRESHOLD:
-        return best_row
-    return None
+    return best_row
 
 
 def get_memory_hints(task_description: str) -> str:
@@ -177,17 +328,24 @@ def get_memory_hints(task_description: str) -> str:
     hints: list[str] = []
 
     # --- similar successful patterns ---
+    query_embedding = _embed_text(task_description)
+
     with _get_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM task_patterns WHERE success_rate >= 0.5 ORDER BY last_used DESC"
         ).fetchall()
 
+    # margin = score - threshold, comparable across rows even when some are
+    # scored via cosine similarity and others (pre-backfill) via
+    # SequenceMatcher — see _score_row's docstring for why margin, not raw
+    # score, is the right ranking key here.
     scored = [
-        (row, _similarity(task_description, row["task_description"]))
+        (row,) + _score_row(task_description, query_embedding, row)
         for row in rows
     ]
+    scored = [(row, score - threshold) for row, score, threshold in scored]
     scored.sort(key=lambda x: x[1], reverse=True)
-    top = [row for row, score in scored if score >= SIMILAR_TASK_THRESHOLD]
+    top = [row for row, margin in scored if margin >= 0]
     top = top[:MAX_MEMORY_HINTS]
 
     for row in top:
@@ -328,6 +486,52 @@ def get_all_preferences() -> dict[str, str]:
             "SELECT pref_key, pref_value FROM user_preferences"
         ).fetchall()
     return {row["pref_key"]: row["pref_value"] for row in rows}
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — bulk embedding backfill
+# ---------------------------------------------------------------------------
+
+def backfill_all_embeddings() -> tuple[int, int]:
+    """
+    Compute and persist embeddings for every task_patterns row that doesn't
+    have one yet. _get_row_embedding() already does this lazily, one row at
+    a time, whenever an existing row happens to get compared against — this
+    is the same thing but eager, for running once via
+    scripts/backfill_embeddings.py right after upgrading to Phase 5 so a
+    large existing memory.db doesn't pay the backfill cost gradually across
+    many future task runs.
+
+    Returns (backfilled_count, skipped_count) where skipped_count is rows
+    that already had an embedding or where the API call failed.
+    """
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, task_description, embedding FROM task_patterns"
+        ).fetchall()
+
+    backfilled = 0
+    skipped    = 0
+
+    for row in rows:
+        if row["embedding"]:
+            skipped += 1
+            continue
+
+        vector = _embed_text(row["task_description"])
+        if vector is None:
+            skipped += 1
+            continue
+
+        with _get_conn() as conn:
+            conn.execute(
+                "UPDATE task_patterns SET embedding = ? WHERE id = ?",
+                (json.dumps(vector), row["id"]),
+            )
+        backfilled += 1
+
+    log.info("Backfill complete: %d embedded, %d skipped", backfilled, skipped)
+    return backfilled, skipped
 
 
 # ---------------------------------------------------------------------------
