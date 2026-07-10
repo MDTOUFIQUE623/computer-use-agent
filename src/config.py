@@ -124,6 +124,52 @@ EMBEDDING_SIMILARITY_THRESHOLD: float = float(
 # Screenshot (vision fallback only)
 SCREENSHOT_WIDTH = 1280
 
+# ---------------------------------------------------------------------------
+# Phase 6 — Multi-agent Supervisor
+# ---------------------------------------------------------------------------
+#
+# ENABLE_MULTI_AGENT_SUPERVISOR: when True, every incoming task is first
+# checked by Brain.decompose_task() for genuinely independent subtasks
+# ("check the weather in NYC and also look up AAPL's stock price" — neither
+# needs the other's output) that can run at the same time. When False, or
+# when decomposition finds nothing splittable, every task goes straight to
+# the normal single-agent plan -> execute -> verify loop exactly as it did
+# before Phase 6 existed. This is strictly additive: worst case (decompose
+# call fails, or finds no parallel split, or the split isn't tool-safe — see
+# PARALLEL_SAFE_TOOLS below) is identical to pre-Phase-6 behavior.
+ENABLE_MULTI_AGENT_SUPERVISOR: bool = (
+    os.getenv("ENABLE_MULTI_AGENT_SUPERVISOR", "true").lower() == "true"
+)
+
+# Hard cap on how many subtasks run concurrently, even if Brain decomposes
+# a task into more pieces than this. Keeps one task from launching an
+# unbounded number of Chromium instances.
+MAX_PARALLEL_SUBTASKS: int = int(os.getenv("MAX_PARALLEL_SUBTASKS", "3"))
+
+# Tools considered safe to run inside a parallel worker thread.
+#
+# BROWSER is safe because BrowserTools drives pages via Playwright's CDP
+# protocol (page.click, page.fill, ...) — synthetic events dispatched
+# straight to the browser process, NOT real OS mouse/keyboard input. Each
+# worker gets its own Playwright browser instance (see graph.py's
+# thread-local _browser_local), so N workers can each drive their own
+# Chromium window at once without fighting over anything.
+#
+# FILES is safe for the same reason distinct file handles are safe in any
+# multithreaded program: independent subtasks (enforced by
+# Brain.decompose_task's independence check) essentially never touch the
+# same path at the same moment.
+#
+# WINDOWS_UI, APPS, OCR, and VISION are deliberately EXCLUDED. They drive
+# the one real mouse/keyboard or read the one real screen — there is
+# exactly one of each on this machine, so two threads clicking or
+# screenshotting at once is not a performance question, it's just broken.
+# If ANY subtask in a decomposition needs one of those tools, the
+# supervisor abandons the parallel path entirely for that task and falls
+# back to the normal sequential single-agent loop — see supervisor_node()
+# in graph.py.
+PARALLEL_SAFE_TOOLS: set[str] = {"browser", "files"}
+
 # PyAutoGUI safety
 pyautogui.FAILSAFE = True   # move mouse to corner to abort
 pyautogui.PAUSE    = 0.4    # small pause after every pyautogui call

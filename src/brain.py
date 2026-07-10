@@ -459,6 +459,48 @@ Return a JSON object with this exact structure:
 
 
 # ---------------------------------------------------------------------------
+# Phase 6 — Decomposition prompt (multi-agent supervisor)
+# ---------------------------------------------------------------------------
+
+DECOMPOSE_SYSTEM_PROMPT = """
+You check whether a task given to a computer-use agent is actually 2+
+FULLY INDEPENDENT subtasks that could be carried out in any order, or even
+at the same time, with neither needing the other's output, timing, or
+state.
+
+Examples that ARE independent (should split):
+- "check the weather in NYC and also look up AAPL's stock price"
+  -> two unrelated lookups, order doesn't matter
+- "search for the best pizza place in Chicago, and separately look up
+   showtimes for the new Batman movie"
+  -> two unrelated searches
+
+Examples that are NOT independent (must NOT split):
+- "search for flights to Tokyo and email me the cheapest one"
+  -> the email needs the search's result
+- "open notepad, write a note, then save it as notes.txt"
+  -> strictly ordered steps of ONE task
+- "find the weather in NYC" (single request, nothing to split)
+- "check the weather in NYC and pack accordingly"
+  -> "pack accordingly" depends on the weather result
+
+When genuinely unsure, do NOT split — treat it as one task. A missed
+opportunity to parallelize costs a little time. Wrongly splitting
+something that actually depends on itself produces silently wrong
+results, which is much worse.
+
+Respond ONLY with this JSON object, no markdown, no explanation outside it:
+{
+  "is_parallel": true|false,
+  "subtasks": ["standalone task 1", "standalone task 2", ...],
+  "reasoning": "one short sentence"
+}
+
+If is_parallel is false, subtasks should be an empty list.
+""".strip()
+
+
+# ---------------------------------------------------------------------------
 # Main Brain class
 # ---------------------------------------------------------------------------
 
@@ -670,6 +712,96 @@ class Brain:
             )
 
         return None
+
+    # -----------------------------------------------------------------------
+    # Phase 6 — Multi-agent Supervisor
+    # -----------------------------------------------------------------------
+
+    def decompose_task(self, task: str) -> Optional[list[str]]:
+        """
+        Check whether `task` is actually 2+ fully independent subtasks that
+        could run at the same time — e.g. "check the weather in NYC and
+        also look up AAPL's stock price". Neither piece needs the other's
+        output or a particular order.
+
+        Returns:
+          - A list of 2+ standalone task strings if the task decomposes
+            into genuinely independent subtasks.
+          - None if the task is a single request, or its parts depend on
+            each other (must run in order), or the Gemini call/parse fails
+            for any reason. None means "run this the normal way" — the
+            caller (graph.py's supervisor_node) falls back to the
+            pre-Phase-6 single-agent plan -> execute -> verify loop.
+
+        This is deliberately conservative: independence is judged by the
+        LLM once, up front, and never revisited mid-execution. Getting it
+        wrong in the "should have split but didn't" direction just costs
+        some parallelism. Getting it wrong in the other direction (splits
+        something that should have stayed sequential) would silently
+        produce wrong results, so the prompt below is written to bias
+        toward NOT splitting whenever there's any doubt.
+        """
+        log.info("Checking task for parallel decomposition: %s", task)
+
+        prompt = self._build_decompose_prompt(task)
+
+        try:
+            response = self._client.models.generate_content(
+                model=PLANNER_MODEL,
+                contents=[prompt],
+                config=types.GenerateContentConfig(
+                    max_output_tokens=500,
+                    system_instruction=DECOMPOSE_SYSTEM_PROMPT,
+                )
+            )
+            raw_text = response.text or ""
+        except Exception as e:
+            log.warning("Decompose call failed, running task normally: %s", e)
+            return None
+
+        return self._parse_decompose_response(raw_text, task)
+
+    def _build_decompose_prompt(self, task: str) -> str:
+        return f'Task: "{task}"\n\nRespond with the JSON object described in your instructions.'
+
+    def _parse_decompose_response(self, raw_text: str, task: str) -> Optional[list[str]]:
+        raw = raw_text.strip()
+
+        for candidate in (raw, _strip_markdown(raw)):
+            try:
+                data = json.loads(candidate)
+                break
+            except json.JSONDecodeError:
+                data = None
+        else:
+            log.warning("Decompose response wasn't valid JSON, running task normally")
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        is_parallel = data.get("is_parallel", False)
+        subtasks    = data.get("subtasks", [])
+
+        if not is_parallel:
+            return None
+
+        if not isinstance(subtasks, list):
+            return None
+
+        # Clean + de-duplicate, drop anything that isn't a non-empty string.
+        cleaned = [s.strip() for s in subtasks if isinstance(s, str) and s.strip()]
+
+        if len(cleaned) < 2:
+            # Model said "parallel" but couldn't actually produce 2+ distinct
+            # subtasks — treat as "not parallel" rather than trusting the flag.
+            return None
+
+        reasoning = data.get("reasoning", "")
+        if reasoning:
+            log.info("Decomposed into %d subtasks: %s", len(cleaned), reasoning)
+
+        return cleaned
 
     def replan_step(
         self,

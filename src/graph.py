@@ -1,6 +1,8 @@
 import os
 import time
 import logging
+import threading
+import concurrent.futures
 from typing import Optional, TypedDict
 
 from dotenv import load_dotenv
@@ -19,7 +21,13 @@ from src.models import (
     VerificationStatus,
     ToolResult,
 )
-from src.config import MAX_RETRIES_PER_STEP, MAX_TOTAL_STEPS
+from src.config import (
+    MAX_RETRIES_PER_STEP,
+    MAX_TOTAL_STEPS,
+    ENABLE_MULTI_AGENT_SUPERVISOR,
+    MAX_PARALLEL_SUBTASKS,
+    PARALLEL_SAFE_TOOLS,
+)
 
 load_dotenv()
 log = logging.getLogger(__name__)
@@ -56,31 +64,49 @@ class GraphState(TypedDict):
     # Typed cross-step state (Phase 1)
     slots: StateSlots
 
+    # Phase 6 — set by supervisor_node if the task decomposes into 2+
+    # independent, tool-safe subtasks; consumed by parallel_execute_node.
+    # None/absent means "run normally" (the overwhelmingly common case).
+    _pending_subtasks: Optional[list[str]]
+
 
 # ---------------------------------------------------------------------------
-# Browser instance management  (Phase 3: mode-aware logging)
+# Browser instance management  (Phase 3: mode-aware logging.
+#                                Phase 6: thread-local, not a module global —
+#                                see note below)
 # ---------------------------------------------------------------------------
-
-_browser_instance = None
+#
+# threading.local() rather than a plain module-level variable: Phase 6's
+# parallel_execute_node runs multiple worker threads, each invoking the
+# full graph (via _worker_app) concurrently. If this were still a single
+# module global, every worker thread would share ONE BrowserTools instance
+# — the second worker to call _get_browser_instance() would silently start
+# driving the first worker's browser/page instead of getting its own,
+# corrupting both tasks. threading.local() gives each thread its own slot
+# automatically. The main thread's behavior is completely unchanged: it
+# still gets one persistent instance across sequential task invocations
+# from main.py's REPL loop, exactly as before — this only isolates threads
+# from EACH OTHER, it doesn't change single-threaded behavior at all.
+_browser_local = threading.local()
 
 
 def _get_browser_instance():
     """
-    Return a persistent browser instance for the current task.
+    Return a persistent browser instance for the current task, scoped to
+    the calling thread.
 
     Phase 3: reads BROWSER_MODE from config transparently — BrowserTools.start()
     handles the actual launch-vs-attach decision. We log which mode was used
     so task output clearly shows whether a real session was involved.
     """
-    global _browser_instance
     from src.tools.browser import BrowserTools
     from src.config import BROWSER_MODE
 
-    if _browser_instance is None:
-        _browser_instance = BrowserTools()
-        result = _browser_instance.start()
+    if getattr(_browser_local, "instance", None) is None:
+        _browser_local.instance = BrowserTools()
+        result = _browser_local.instance.start()
         if result.success:
-            mode = _browser_instance.mode
+            mode = _browser_local.instance.mode
             if mode == "attach":
                 log.info(
                     "[BROWSER] Attached to running Chrome via CDP "
@@ -95,22 +121,22 @@ def _get_browser_instance():
         else:
             log.error("[BROWSER] Failed to start: %s", result.error)
 
-    return _browser_instance
+    return _browser_local.instance
 
 
 def _close_browser_instance():
     """
-    Close and clear the browser instance.
+    Close and clear the browser instance for the current thread.
 
     Phase 3: in attach mode BrowserTools.close() only disconnects Playwright;
     it never kills the real Chrome. We log this clearly so users aren't
     surprised when Chrome stays open after a task.
     """
-    global _browser_instance
-    if _browser_instance is not None:
-        mode = _browser_instance.mode
+    instance = getattr(_browser_local, "instance", None)
+    if instance is not None:
+        mode = instance.mode
         try:
-            _browser_instance.close()
+            instance.close()
             if mode == "attach":
                 log.info(
                     "[BROWSER] Disconnected from Chrome CDP "
@@ -122,7 +148,7 @@ def _close_browser_instance():
                 )
         except Exception:
             pass
-        _browser_instance = None
+        _browser_local.instance = None
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +218,175 @@ def _execute_step(step: Step, brain: Brain, state: GraphState) -> ToolResult:
 # ---------------------------------------------------------------------------
 # Graph nodes
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Multi-agent Supervisor
+# ---------------------------------------------------------------------------
+
+def supervisor_node(state: GraphState) -> dict:
+    """
+    Entry point for every task. Checks whether it decomposes into 2+
+    genuinely independent subtasks that are safe to run in parallel, and
+    if so stashes them in `_pending_subtasks` for parallel_execute_node.
+
+    Falls through to the normal single-agent path (returns {}, meaning
+    "no subtasks pending") in every other case:
+      - ENABLE_MULTI_AGENT_SUPERVISOR is off
+      - Brain.decompose_task finds nothing splittable (the common case)
+      - more subtasks came back than MAX_PARALLEL_SUBTASKS allows
+      - any subtask's own plan needs a tool outside PARALLEL_SAFE_TOOLS
+        (WINDOWS_UI, APPS, OCR, VISION all touch the one real mouse/
+        keyboard/screen and can never safely run concurrently)
+      - planning any subtask outright fails
+
+    This function calls Brain.plan_task once per candidate subtask to
+    safety-check its tools BEFORE committing to the parallel path — a
+    little extra planning cost up front, paid only when decomposition
+    already found something to split, in exchange for never fanning out
+    a plan we haven't inspected.
+    """
+    if not ENABLE_MULTI_AGENT_SUPERVISOR:
+        return {}
+
+    brain = Brain()
+    subtasks = brain.decompose_task(state["task"])
+
+    if not subtasks:
+        return {}  # not decomposable — normal single-agent path
+
+    if len(subtasks) > MAX_PARALLEL_SUBTASKS:
+        print(
+            f"\n[SUPERVISOR] Task split into {len(subtasks)} subtasks, "
+            f"more than MAX_PARALLEL_SUBTASKS={MAX_PARALLEL_SUBTASKS} — "
+            "running as a single task instead."
+        )
+        return {}
+
+    print(f"\n[SUPERVISOR] Task looks parallelizable into {len(subtasks)} subtasks:")
+    for i, sub in enumerate(subtasks, 1):
+        print(f"  {i}. {sub}")
+
+    print("[SUPERVISOR] Checking each subtask's tools are parallel-safe...")
+    safe_plans: dict[str, Plan] = {}
+    for sub in subtasks:
+        plan = brain.plan_task(sub)
+        if plan is None:
+            print(f"[SUPERVISOR] Could not plan subtask '{sub}' — running as a single task instead.")
+            return {}
+
+        unsafe_tools = {
+            step.tool.value for step in plan.steps
+            if step.tool.value not in PARALLEL_SAFE_TOOLS
+        }
+        if unsafe_tools:
+            print(
+                f"[SUPERVISOR] Subtask '{sub}' needs {sorted(unsafe_tools)} "
+                f"(not parallel-safe) — running as a single task instead."
+            )
+            return {}
+
+        safe_plans[sub] = plan
+
+    print(f"[SUPERVISOR] All {len(subtasks)} subtasks are parallel-safe — fanning out.")
+    return {"_pending_subtasks": subtasks}
+
+
+def _run_subtask_in_worker(subtask: str) -> dict:
+    """
+    Run one subtask through the full worker graph (plan -> execute ->
+    verify -> retry -> complete/failed) in whatever thread this is called
+    from. Each call gets its own StateSlots and — because
+    _get_browser_instance() is thread-local — its own BrowserTools
+    instance, so N of these can run concurrently without interfering.
+    """
+    initial_state = {
+        "task":               subtask,
+        "plan":               None,
+        "current_step_index": 0,
+        "step_results":       [],
+        "retry_count":        0,
+        "is_done":            False,
+        "is_failed":          False,
+        "memory_hints":       None,
+        "last_error":         None,
+        "ask_user_message":   None,
+        "task_start_ms":      None,
+        "_last_tool_result":  None,
+        "_last_step_result":  None,
+        "slots":              None,
+        "_pending_subtasks":  None,
+    }
+    try:
+        return _worker_app.invoke(initial_state)
+    except Exception as e:
+        log.error("Worker thread crashed on subtask '%s': %s", subtask, e, exc_info=True)
+        # Best-effort cleanup for this thread's browser even if the graph
+        # itself crashed before reaching complete_node/failed_node.
+        try:
+            _close_browser_instance()
+        except Exception:
+            pass
+        return {
+            "task": subtask,
+            "is_done": True,
+            "is_failed": True,
+            "last_error": f"Worker thread crashed: {e}",
+            "step_results": [],
+        }
+
+
+def parallel_execute_node(state: GraphState) -> dict:
+    """
+    Fan out state["_pending_subtasks"] across a thread pool, one worker
+    graph invocation per subtask, and print an aggregate summary once
+    they've all finished. Each worker already runs its own
+    complete_node/failed_node (memory recording, thread-local browser
+    cleanup) internally via _worker_app — this node's only job is to
+    launch them, wait, and report.
+    """
+    subtasks = state["_pending_subtasks"]
+    start_ms = int(time.monotonic() * 1000)
+
+    print(f"\n{'='*50}")
+    print(f"  RUNNING {len(subtasks)} SUBTASKS IN PARALLEL")
+    print(f"{'='*50}")
+
+    results: dict[str, dict] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(subtasks)) as pool:
+        future_to_task = {
+            pool.submit(_run_subtask_in_worker, sub): sub for sub in subtasks
+        }
+        for future in concurrent.futures.as_completed(future_to_task):
+            sub = future_to_task[future]
+            results[sub] = future.result()
+
+    elapsed = int(time.monotonic() * 1000) - start_ms
+
+    print(f"\n{'='*50}")
+    print(f"  PARALLEL RUN COMPLETE  ({elapsed}ms wall time)")
+    print(f"{'='*50}")
+
+    succeeded = 0
+    for sub in subtasks:  # preserve original order in the summary
+        result = results.get(sub, {})
+        ok = result.get("is_done") and not result.get("is_failed")
+        succeeded += int(bool(ok))
+        symbol = "✓" if ok else "✗"
+        print(f"\n  {symbol} {sub}")
+
+        slots = result.get("slots")
+        if ok and slots is not None and getattr(slots, "last_text", None):
+            preview = slots.last_text[:500]
+            print(f"    {preview}")
+        elif not ok:
+            reason = result.get("ask_user_message") or result.get("last_error") or "unknown error"
+            print(f"    {reason}")
+
+    print(f"\n  {succeeded}/{len(subtasks)} subtasks succeeded")
+    print(f"{'='*50}\n")
+
+    return {"is_done": True, "is_failed": succeeded == 0}
+
 
 def plan_node(state: GraphState) -> dict:
     """Call Brain to produce a Plan for the task."""
@@ -637,7 +832,7 @@ def complete_node(state: GraphState) -> dict:
         # a task that never opened one is confusing, not just harmless
         # (observed 2026-07-06: a pure spotify_playlist task printed this
         # despite src.graph never having attached to Chrome).
-        if _browser_instance is not None:
+        if getattr(_browser_local, "instance", None) is not None:
             print("\n[LIFECYCLE] Leaving browser open — task result is meant to stay visible.")
     elif policy == "ask_user":
         print("\n[ACTION NEEDED]\nEverything is ready. Would you like me to keep the browser open? (leaving it open for now)")
@@ -667,7 +862,7 @@ def failed_node(state: GraphState) -> dict:
     if policy == "auto_close":
         _close_browser_instance()
     elif policy == "keep_open":
-        if _browser_instance is not None:
+        if getattr(_browser_local, "instance", None) is not None:
             print("\n[LIFECYCLE] Leaving browser open despite failure — you may want to inspect the page.")
     elif policy == "ask_user":
         print("\n[ACTION NEEDED]\nTask failed. Would you like me to keep the browser open? (leaving it open for now)")
@@ -724,12 +919,39 @@ def after_plan(state: GraphState) -> str:
     return "route"
 
 
+def should_supervise(state: GraphState) -> str:
+    """
+    Phase 6: after supervisor_node, go to the parallel path only if it
+    actually stashed 2+ subtasks. Every other case — supervisor disabled,
+    nothing to split, split rejected as unsafe — falls through to the
+    exact same "plan" entry point single-agent tasks always used.
+    """
+    subtasks = state.get("_pending_subtasks")
+    if subtasks and len(subtasks) >= 2:
+        return "parallel_execute"
+    return "plan"
+
+
 # ---------------------------------------------------------------------------
 # Build the graph
 # ---------------------------------------------------------------------------
 
-def build_graph():
-    """Construct and compile the LangGraph workflow."""
+def build_graph(with_supervisor: bool = True):
+    """
+    Construct and compile the LangGraph workflow.
+
+    with_supervisor=True  (default) — the normal entry point used by
+        main.py. START -> supervisor -> (parallel_execute | plan).
+
+    with_supervisor=False — used internally for _worker_app, the graph
+        each parallel_execute_node worker thread invokes. Skips the
+        supervisor node entirely (START -> plan directly) so that:
+          (a) a worker never re-decomposes an already-atomic subtask
+              (wasted Brain call, and the wrong place to judge
+              independence again), and
+          (b) fanned-out subtasks can never themselves fan out further —
+              one level of parallelism, not unbounded recursive forking.
+    """
     workflow = StateGraph(GraphState)
 
     workflow.add_node("plan",     plan_node)
@@ -740,7 +962,19 @@ def build_graph():
     workflow.add_node("complete", complete_node)
     workflow.add_node("failed",   failed_node)
 
-    workflow.add_edge(START, "plan")
+    if with_supervisor:
+        workflow.add_node("supervisor",       supervisor_node)
+        workflow.add_node("parallel_execute", parallel_execute_node)
+
+        workflow.add_edge(START, "supervisor")
+        workflow.add_conditional_edges(
+            "supervisor",
+            should_supervise,
+            {"parallel_execute": "parallel_execute", "plan": "plan"}
+        )
+        workflow.add_edge("parallel_execute", END)
+    else:
+        workflow.add_edge(START, "plan")
 
     workflow.add_conditional_edges(
         "plan",
@@ -779,5 +1013,8 @@ def build_graph():
     return workflow.compile()
 
 
-# Compiled graph — imported by main.py
-app = build_graph()
+# Compiled graphs — imported by main.py (app) and used internally by
+# parallel_execute_node (_worker_app, see build_graph's with_supervisor
+# docstring for why workers use a separate, supervisor-less compilation).
+app = build_graph(with_supervisor=True)
+_worker_app = build_graph(with_supervisor=False)
