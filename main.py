@@ -165,6 +165,9 @@ def run():
             "_last_tool_result":  None,
             "_last_step_result":  None,
             "slots":              None,
+            "_pending_subtasks":  None,
+            "_precomputed_plans": None,
+            "_precomputed_plan":  None,
         }
 
         try:
