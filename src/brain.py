@@ -26,6 +26,55 @@ log = logging.getLogger(__name__)
 # How many times Brain can replan a single failed step
 MAX_REPLAN_ATTEMPTS = 2
 
+# ---------------------------------------------------------------------------
+# Transient-error retry (added after Phase 6 real-world testing)
+# ---------------------------------------------------------------------------
+#
+# Phase 6's parallel_execute_node fires N planning calls to Gemini at
+# essentially the same moment (one per worker), which raises the odds of
+# hitting a transient 503 "high demand" / 429 rate-limit response compared
+# to the single-call-at-a-time pattern every other phase used. This was a
+# real, observed failure — one subtask's plan_task call failed outright on
+# a 503 while a sibling worker's identical call succeeded a few seconds
+# later. A short retry-with-backoff on transient errors specifically
+# (never on real errors like a malformed prompt) fixes this without
+# touching the actual planning logic.
+_TRANSIENT_ERROR_MARKERS = (
+    "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "high demand",
+)
+
+
+def _is_transient_gemini_error(e: Exception) -> bool:
+    text = str(e)
+    return any(marker in text for marker in _TRANSIENT_ERROR_MARKERS)
+
+
+def _call_with_retry(fn, *, max_attempts: int = 3, base_delay_s: float = 1.5):
+    """
+    Call fn() (a zero-arg callable wrapping one Gemini request). On a
+    transient error, wait base_delay_s * attempt and retry, up to
+    max_attempts total tries. On a non-transient error, or after the last
+    attempt, re-raises so the caller's existing try/except (which already
+    logs and returns None) handles it exactly as before — this only adds
+    retries, it doesn't change what "give up" looks like.
+    """
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            if attempt < max_attempts and _is_transient_gemini_error(e):
+                delay = base_delay_s * attempt
+                log.warning(
+                    "Transient Gemini error (attempt %d/%d), retrying in %.1fs: %s",
+                    attempt, max_attempts, delay, e,
+                )
+                time.sleep(delay)
+                continue
+            raise last_exc
+
+
 # Tool + Action catalogue sent to Gemini in the planning prompt
 # ---------------------------------------------------------------------------
 
@@ -500,6 +549,54 @@ If is_parallel is false, subtasks should be an empty list.
 """.strip()
 
 
+# Phrases that reliably signal "these are two separate things," used by
+# looks_potentially_parallel() below. Deliberately short and specific —
+# a false negative here just costs some parallelism (task runs normally
+# instead of concurrently), a false positive costs one wasted Gemini call
+# via decompose_task, which itself is safe (defaults to "don't split").
+# So this list can stay conservative without any correctness risk either way.
+_PARALLEL_SIGNAL_PHRASES = (
+    "and also", "and separately", "at the same time", "simultaneously",
+    "meanwhile", "in parallel", "and additionally", "and while you're",
+)
+
+
+def looks_potentially_parallel(task: str) -> bool:
+    """
+    Cheap, zero-API-call pre-filter run before Brain.decompose_task().
+
+    decompose_task() is reliable (an LLM judging independence beats any
+    regex), but it costs a Gemini call on EVERY task, including the large
+    majority that are single requests and were never going to split. That
+    was a real, measured ~2s latency tax on every single task once
+    Phase 6 shipped — see the July 2026 test run where "look up today's
+    weather in NYC" paid a decompose_task call before planning even
+    started, despite obviously being one request.
+
+    This function decides whether it's even worth ASKING the LLM:
+      - explicit signal phrase ("and also", "and separately", ...) → True
+      - 2+ occurrences of " and " → True (single " and " is usually just
+        a normal dependent clause — "search X and save to Y" — so we
+        require 2+ to reduce false positives on ordinary compound tasks)
+      - otherwise → False, decompose_task is skipped entirely and the
+        task goes straight to planning, exactly like every phase before
+        Phase 6 existed.
+
+    Errs toward False (skip the LLM check) when unsure: the cost of a
+    false negative is losing potential parallelism on an oddly-phrased
+    compound task, which just means it runs sequentially instead — never
+    wrong, just not as fast as it could have been. The cost of over-
+    calling decompose_task on every task was a universal latency tax,
+    which is the actual problem this function exists to fix.
+    """
+    task_lower = f" {task.lower()} "  # pad so " and " matches at edges too
+
+    if any(phrase in task_lower for phrase in _PARALLEL_SIGNAL_PHRASES):
+        return True
+
+    return task_lower.count(" and ") >= 2
+
+
 # ---------------------------------------------------------------------------
 # Main Brain class
 # ---------------------------------------------------------------------------
@@ -556,14 +653,14 @@ class Brain:
 
         # Step 3 — call Gemini
         try:
-            response = self._client.models.generate_content(
+            response = _call_with_retry(lambda: self._client.models.generate_content(
                 model=PLANNER_MODEL,
                 contents=[prompt],
                 config=types.GenerateContentConfig(
                     max_output_tokens=2000,
                     system_instruction=PLANNER_SYSTEM_PROMPT,
                 )
-            )
+            ))
 
             raw_text = response.text or ""
             log.debug("Raw planner response: %s", raw_text[:500])
@@ -740,20 +837,26 @@ class Brain:
         something that should have stayed sequential) would silently
         produce wrong results, so the prompt below is written to bias
         toward NOT splitting whenever there's any doubt.
+
+        NOTE: graph.py's supervisor_node calls looks_potentially_parallel()
+        BEFORE calling this method, and skips calling it entirely for
+        tasks that obviously aren't compound (the common case) — see that
+        function's docstring for why this method itself stays a plain
+        unconditional Gemini call rather than doing its own pre-filtering.
         """
         log.info("Checking task for parallel decomposition: %s", task)
 
         prompt = self._build_decompose_prompt(task)
 
         try:
-            response = self._client.models.generate_content(
+            response = _call_with_retry(lambda: self._client.models.generate_content(
                 model=PLANNER_MODEL,
                 contents=[prompt],
                 config=types.GenerateContentConfig(
                     max_output_tokens=500,
                     system_instruction=DECOMPOSE_SYSTEM_PROMPT,
                 )
-            )
+            ))
             raw_text = response.text or ""
         except Exception as e:
             log.warning("Decompose call failed, running task normally: %s", e)

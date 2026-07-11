@@ -1,4 +1,6 @@
 import os
+import sys
+import io
 import time
 import logging
 import threading
@@ -8,7 +10,7 @@ from typing import Optional, TypedDict
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, START, END
 
-from src.brain import Brain
+from src.brain import Brain, looks_potentially_parallel
 from src.verifier import verify_step
 from src.state import StateSlots, resolve_placeholder, describe_slots
 from src.registry import get_registry, ExecutionContext
@@ -68,6 +70,17 @@ class GraphState(TypedDict):
     # independent, tool-safe subtasks; consumed by parallel_execute_node.
     # None/absent means "run normally" (the overwhelmingly common case).
     _pending_subtasks: Optional[list[str]]
+
+    # Phase 6 — the Plans supervisor_node already generated while doing its
+    # tool-safety check, keyed by subtask string. Threaded through to each
+    # worker so plan_node can reuse them instead of calling Brain.plan_task
+    # a second time for the same subtask (which was silently happening
+    # before this field existed — see plan_node's docstring).
+    _precomputed_plans: Optional[dict]
+
+    # Per-worker: the single precomputed Plan for THIS worker's subtask,
+    # set by _run_subtask_in_worker from _precomputed_plans.
+    _precomputed_plan: Optional[Plan]
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +165,104 @@ def _close_browser_instance():
 
 
 # ---------------------------------------------------------------------------
+# Phase 6 — output buffering (added after real-world testing)
+# ---------------------------------------------------------------------------
+#
+# Every node function (plan_node, execute_node, etc.) and several tool
+# executors call plain print() to show live progress. That's fine for one
+# task at a time, but parallel_execute_node runs several of them
+# concurrently, and print() calls from different threads land on the
+# terminal in whatever order the OS scheduler happens to interleave
+# them — observed directly in testing: two subtasks' "TASK: ..." headers
+# and step logs got shuffled together mid-line, even though both subtasks
+# completed with fully correct, separately-tracked results underneath.
+#
+# The fix: give each worker thread its own in-memory buffer, silently
+# redirect that thread's print() calls into it instead of the real
+# terminal, and flush the whole thing as one uninterrupted block — under
+# a lock, so two flushes can't interleave with each other either — the
+# moment that subtask finishes. The trade-off this buys: you no longer
+# see a parallel subtask's steps appear live as they happen, only once
+# that whole subtask is done. Given the alternative was jumbled,
+# hard-to-read output, that's the right trade for this use case.
+#
+# Nothing about this touches logging module output (the timestamped
+# "[INFO] src.brain: ..." lines) — those go through a logging.StreamHandler
+# that bound itself to the real stderr once, at startup in main.py, well
+# before this wrapper ever installs itself. Only print()'s target
+# (sys.stdout) is affected, and only for threads that opt in by setting
+# their own buffer — the main thread (every normal, non-parallel task)
+# never does, so this is fully transparent for the common case.
+
+_stdout_buffer_local = threading.local()
+_stdout_flush_lock    = threading.Lock()
+
+
+class _ThreadAwareStdout:
+    """
+    Wraps the real stdout. write() checks whether the CALLING thread has
+    opted into buffering (via _stdout_buffer_local.buffer) and routes
+    there instead of the terminal if so; otherwise passes straight
+    through untouched. Installed once, globally, at import time — see
+    _install_thread_aware_stdout() below.
+    """
+
+    def __init__(self, real_stdout):
+        self._real = real_stdout
+
+    def write(self, s: str) -> int:
+        buffer = getattr(_stdout_buffer_local, "buffer", None)
+        if buffer is not None:
+            return buffer.write(s)
+        return self._real.write(s)
+
+    def flush(self) -> None:
+        buffer = getattr(_stdout_buffer_local, "buffer", None)
+        if buffer is None:
+            self._real.flush()
+        # Buffered mode: nothing to flush to the terminal yet — that
+        # happens explicitly via _flush_worker_output() when the
+        # subtask finishes, not on every ordinary flush() call.
+
+    def __getattr__(self, name):
+        # Delegate anything else (isatty, encoding, ...) to the real stream.
+        return getattr(self._real, name)
+
+
+def _install_thread_aware_stdout() -> None:
+    if not isinstance(sys.stdout, _ThreadAwareStdout):
+        sys.stdout = _ThreadAwareStdout(sys.stdout)
+
+
+def _begin_buffered_output() -> None:
+    """Call at the start of a worker thread's subtask run."""
+    _stdout_buffer_local.buffer = io.StringIO()
+
+
+def _flush_worker_output() -> None:
+    """
+    Call at the end of a worker thread's subtask run (success OR failure —
+    callers must use try/finally). Writes the whole buffered transcript to
+    the real terminal as one lock-protected block, then clears this
+    thread's buffer so a reused thread doesn't keep appending to stale data.
+    """
+    buffer = getattr(_stdout_buffer_local, "buffer", None)
+    if buffer is None:
+        return
+
+    text = buffer.getvalue()
+    real_stdout = sys.stdout._real if isinstance(sys.stdout, _ThreadAwareStdout) else sys.stdout
+    with _stdout_flush_lock:
+        real_stdout.write(text)
+        real_stdout.flush()
+
+    _stdout_buffer_local.buffer = None
+
+
+_install_thread_aware_stdout()
+
+
+# ---------------------------------------------------------------------------
 # Route to correct executor (Phase 2: registry lookup)
 # ---------------------------------------------------------------------------
 
@@ -232,7 +343,11 @@ def supervisor_node(state: GraphState) -> dict:
     Falls through to the normal single-agent path (returns {}, meaning
     "no subtasks pending") in every other case:
       - ENABLE_MULTI_AGENT_SUPERVISOR is off
-      - Brain.decompose_task finds nothing splittable (the common case)
+      - looks_potentially_parallel(task) is False — the common case, and
+        the one that used to cost every task a ~2s Gemini round-trip for
+        nothing (see looks_potentially_parallel's docstring). Skips
+        decompose_task's API call entirely, not just its result.
+      - Brain.decompose_task finds nothing splittable
       - more subtasks came back than MAX_PARALLEL_SUBTASKS allows
       - any subtask's own plan needs a tool outside PARALLEL_SAFE_TOOLS
         (WINDOWS_UI, APPS, OCR, VISION all touch the one real mouse/
@@ -247,6 +362,9 @@ def supervisor_node(state: GraphState) -> dict:
     """
     if not ENABLE_MULTI_AGENT_SUPERVISOR:
         return {}
+
+    if not looks_potentially_parallel(state["task"]):
+        return {}  # doesn't even look compound — skip the Gemini call entirely
 
     brain = Brain()
     subtasks = brain.decompose_task(state["task"])
@@ -288,51 +406,68 @@ def supervisor_node(state: GraphState) -> dict:
         safe_plans[sub] = plan
 
     print(f"[SUPERVISOR] All {len(subtasks)} subtasks are parallel-safe — fanning out.")
-    return {"_pending_subtasks": subtasks}
+    return {"_pending_subtasks": subtasks, "_precomputed_plans": safe_plans}
 
 
-def _run_subtask_in_worker(subtask: str) -> dict:
+def _run_subtask_in_worker(subtask: str, precomputed_plan: Optional[Plan]) -> dict:
     """
     Run one subtask through the full worker graph (plan -> execute ->
     verify -> retry -> complete/failed) in whatever thread this is called
     from. Each call gets its own StateSlots and — because
     _get_browser_instance() is thread-local — its own BrowserTools
     instance, so N of these can run concurrently without interfering.
+
+    precomputed_plan is the Plan supervisor_node already generated for
+    this exact subtask while checking tool-safety. Passing it through
+    lets plan_node skip a second, redundant Brain.plan_task call (which
+    would otherwise re-run memory-hint lookup + a full Gemini call for a
+    plan we already have) — see plan_node's docstring.
+
+    All of this subtask's print() output is buffered and flushed as one
+    block when it finishes (success, failure, or crash) — see
+    _begin_buffered_output()/_flush_worker_output() above — so it never
+    interleaves mid-line with a sibling worker's output on the terminal.
     """
-    initial_state = {
-        "task":               subtask,
-        "plan":               None,
-        "current_step_index": 0,
-        "step_results":       [],
-        "retry_count":        0,
-        "is_done":            False,
-        "is_failed":          False,
-        "memory_hints":       None,
-        "last_error":         None,
-        "ask_user_message":   None,
-        "task_start_ms":      None,
-        "_last_tool_result":  None,
-        "_last_step_result":  None,
-        "slots":              None,
-        "_pending_subtasks":  None,
-    }
+    _begin_buffered_output()
     try:
-        return _worker_app.invoke(initial_state)
-    except Exception as e:
-        log.error("Worker thread crashed on subtask '%s': %s", subtask, e, exc_info=True)
-        # Best-effort cleanup for this thread's browser even if the graph
-        # itself crashed before reaching complete_node/failed_node.
-        try:
-            _close_browser_instance()
-        except Exception:
-            pass
-        return {
-            "task": subtask,
-            "is_done": True,
-            "is_failed": True,
-            "last_error": f"Worker thread crashed: {e}",
-            "step_results": [],
+        initial_state = {
+            "task":               subtask,
+            "plan":               None,
+            "current_step_index": 0,
+            "step_results":       [],
+            "retry_count":        0,
+            "is_done":            False,
+            "is_failed":          False,
+            "memory_hints":       None,
+            "last_error":         None,
+            "ask_user_message":   None,
+            "task_start_ms":      None,
+            "_last_tool_result":  None,
+            "_last_step_result":  None,
+            "slots":              None,
+            "_pending_subtasks":  None,
+            "_precomputed_plans": None,
+            "_precomputed_plan":  precomputed_plan,
         }
+        try:
+            return _worker_app.invoke(initial_state)
+        except Exception as e:
+            log.error("Worker thread crashed on subtask '%s': %s", subtask, e, exc_info=True)
+            # Best-effort cleanup for this thread's browser even if the graph
+            # itself crashed before reaching complete_node/failed_node.
+            try:
+                _close_browser_instance()
+            except Exception:
+                pass
+            return {
+                "task": subtask,
+                "is_done": True,
+                "is_failed": True,
+                "last_error": f"Worker thread crashed: {e}",
+                "step_results": [],
+            }
+    finally:
+        _flush_worker_output()
 
 
 def parallel_execute_node(state: GraphState) -> dict:
@@ -345,6 +480,7 @@ def parallel_execute_node(state: GraphState) -> dict:
     launch them, wait, and report.
     """
     subtasks = state["_pending_subtasks"]
+    precomputed_plans = state.get("_precomputed_plans") or {}
     start_ms = int(time.monotonic() * 1000)
 
     print(f"\n{'='*50}")
@@ -354,7 +490,8 @@ def parallel_execute_node(state: GraphState) -> dict:
     results: dict[str, dict] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(subtasks)) as pool:
         future_to_task = {
-            pool.submit(_run_subtask_in_worker, sub): sub for sub in subtasks
+            pool.submit(_run_subtask_in_worker, sub, precomputed_plans.get(sub)): sub
+            for sub in subtasks
         }
         for future in concurrent.futures.as_completed(future_to_task):
             sub = future_to_task[future]
@@ -389,14 +526,32 @@ def parallel_execute_node(state: GraphState) -> dict:
 
 
 def plan_node(state: GraphState) -> dict:
-    """Call Brain to produce a Plan for the task."""
+    """
+    Call Brain to produce a Plan for the task — unless supervisor_node
+    (Phase 6) already planned this exact subtask while doing its
+    tool-safety check, in which case reuse that Plan instead of paying
+    for a second Gemini call + a second memory-hints lookup.
+
+    (This used to always re-plan even for parallel subtasks, which meant
+    every parallelized task was silently planned twice — once during
+    supervisor_node's safety check, once again here. Wasted latency and
+    Gemini quota, and doubled up on the very API load that made a
+    concurrent worker more likely to hit a transient 503 in the first
+    place. Fixed by threading the precomputed Plan through via
+    _precomputed_plan.)
+    """
     print(f"\n{'='*50}")
     print(f"  TASK: {state['task']}")
     print(f"{'='*50}")
-    print("\n[PLAN] Generating execution plan...")
 
-    brain = Brain()
-    plan  = brain.plan_task(state["task"])
+    precomputed = state.get("_precomputed_plan")
+    if precomputed is not None:
+        print("\n[PLAN] Reusing plan from supervisor's tool-safety check (Phase 6) — no duplicate Gemini call.")
+        plan = precomputed
+    else:
+        print("\n[PLAN] Generating execution plan...")
+        brain = Brain()
+        plan  = brain.plan_task(state["task"])
 
     if plan is None:
         print("[PLAN] Failed to generate plan")

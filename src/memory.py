@@ -38,6 +38,20 @@ def _get_conn():
     """Yield a connection and auto-commit/rollback."""
     conn = sqlite3.connect(MEMORY_DB_PATH)
     conn.row_factory = sqlite3.Row
+
+    # Phase 6 hardening: parallel_execute_node runs multiple worker threads
+    # that each hit memory.db independently (memory hints during planning,
+    # save_task_pattern at the end) — concurrently, not one-at-a-time like
+    # every prior phase assumed. SQLite's default journal mode takes an
+    # exclusive lock for the whole duration of a write, so two workers
+    # writing at once can raise "database is locked" outright. WAL mode
+    # lets readers and a writer proceed at the same time in the common
+    # case, and busy_timeout makes sqlite3 retry internally for up to 5s
+    # on the remaining writer-vs-writer contention instead of raising
+    # immediately. Both are no-ops for the normal single-threaded case.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+
     try:
         yield conn
         conn.commit()
