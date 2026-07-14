@@ -1,6 +1,7 @@
 import pyautogui
 import os
 from pathlib import Path
+from typing import Optional
 
 #Base paths
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -11,6 +12,51 @@ LOG_PATH.mkdir(exist_ok=True)
 #Models
 PLANNER_MODEL="gemini-2.5-flash"
 VISION_MODEL="gemini-2.5-flash"
+
+# ---------------------------------------------------------------------------
+# Phase 7 — Ollama / Local Model Backend
+# ---------------------------------------------------------------------------
+#
+# PLANNER_BACKEND selects which LLMClient Brain uses for its planning,
+# decompose, and replan calls (see src/llm_backends.py). Not restricted
+# to "gemini"/"ollama" forever — it's validated at runtime against
+# whatever's registered in LLM_BACKENDS, so a new backend registered via
+# register_llm_backend() automatically becomes a valid value here without
+# any change to this file.
+#
+#   "gemini" (default) — cloud, requires GEMINI_API_KEY, costs per call
+#             (see the cost breakdown from Phase 6 testing), most
+#             reliable at producing valid structured JSON.
+#
+#   "ollama" — local, free, requires `ollama serve` running and
+#             OLLAMA_MODEL pulled (`ollama pull <model>`). No per-call
+#             cost, works offline, but expect lower reliability on the
+#             planner's structured-JSON output with smaller models —
+#             mitigated by requesting Ollama's own JSON-constrained
+#             `format` mode, but not eliminated. Vision fallback and
+#             memory embeddings still use Gemini regardless of this
+#             setting — see llm_backends.py's module docstring for why.
+PLANNER_BACKEND: str = os.getenv("PLANNER_BACKEND", "gemini")
+
+# Which local model Ollama should use for planning calls. Deliberately
+# just a string, not an enum of specific model names — pull whatever you
+# want (`ollama pull <model>`) and point this at it; nothing else in the
+# code needs to change. qwen3:8b is a reasonable general-purpose default
+# if you haven't picked one — smaller/code-focused models (gemma3:1b,
+# deepseek-coder) are worth trying too, but expect more JSON-parsing
+# retries from a model that small on a task this structured.
+OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+
+# Where `ollama serve` is listening. Only needs changing if you've moved
+# Ollama's default port or are pointing at Ollama running on another
+# machine on your network.
+OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+
+# Local models on consumer hardware (especially CPU-only, or a model
+# that's larger than comfortably fits in VRAM) can take much longer per
+# call than a cloud API — 120s default is generous on purpose. Raise it
+# further if you see timeout errors with a larger model.
+OLLAMA_REQUEST_TIMEOUT_S: int = int(os.getenv("OLLAMA_REQUEST_TIMEOUT_S", "120"))
 
 #Response limits
 MAX_PLAN_TOKENS = 2000
@@ -72,6 +118,29 @@ CDP_ATTACH_TIMEOUT_MS: int = int(os.getenv("CDP_ATTACH_TIMEOUT_MS", "10000"))
 # a new one?  "reuse" keeps your browsing session intact; "new" is cleaner
 # for automation but opens a tab the user will see afterwards.
 CDP_TAB_POLICY: str = os.getenv("CDP_TAB_POLICY", "new")  # "new" | "reuse"
+
+# ---------------------------------------------------------------------------
+# Tavily search (optional fast path for search_web)
+# ---------------------------------------------------------------------------
+#
+# Tavily is a search API built for LLM agents: one HTTP call returns
+# already-extracted, already-ranked page content — no browser needed to
+# get an answer. BrowserTools.search_web() tries Tavily first (if a key
+# is set) and, on success, navigates the browser straight to Tavily's top
+# result instead of DuckDuckGo's search page. This skips a hop (DDG's own
+# search-results page, which is often bot-defensive and returns mostly
+# nav/ad chrome when extract_text reads it) and generally lands on a more
+# authoritative, more directly relevant source.
+#
+# Not required: with no key set, search_web silently uses the original
+# DuckDuckGo flow, identical to before this existed. Also not required
+# for a task to complete correctly if Tavily's call fails or times out —
+# that failure just falls through to the same DuckDuckGo path, so this is
+# purely a speed/quality upgrade, never a new failure mode.
+TAVILY_API_KEY: Optional[str] = os.getenv("TAVILY_API_KEY")
+ENABLE_TAVILY_SEARCH: bool = bool(TAVILY_API_KEY)
+TAVILY_TIMEOUT_S: float = float(os.getenv("TAVILY_TIMEOUT_S", "5"))
+TAVILY_MAX_RESULTS: int = int(os.getenv("TAVILY_MAX_RESULTS", "5"))
 
 
 #Browser (launch-mode settings — ignored in attach mode)
