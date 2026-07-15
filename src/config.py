@@ -285,3 +285,54 @@ LOG_LEVEL = "INFO"   # DEBUG | INFO | WARNING | ERROR
 
 # pyautogui.FAILSAFE = True
 # pyautogui.PAUSE = 0.5
+
+# ---------------------------------------------------------------------------
+# Phase 8 — Voice + Hotkey Trigger
+# ---------------------------------------------------------------------------
+#
+# VOICE_ENABLED replaces main.py's terminal input() loop entirely with a
+# global-hotkey + system-tray flow when true (see src/voice.py). Default
+# false — this needs extra dependencies (faster-whisper, sounddevice,
+# pynput, pystray; see pyproject.toml's 'voice' extras group) most people
+# running this agent via the terminal don't need, and a working
+# microphone, which nothing in this sandbox-testable-by-Claude codebase
+# can verify — this phase needs real hands-on testing on your machine.
+VOICE_ENABLED: bool = os.getenv("VOICE_ENABLED", "false").lower() == "true"
+
+# pynput hotkey format: <modifier>+<modifier>+<key>, e.g. "<ctrl>+<alt>+<space>".
+# Special keys (space, enter, tab, function keys, ...) need angle
+# brackets too, not just modifiers — "<ctrl>+<alt>+space" looks
+# reasonable but pynput's HotKey.parse rejects bare "space" outright
+# (ValueError: space) since it only recognizes angle-bracketed names or
+# single printable characters. Verified directly against pynput before
+# settling on this default. Regular letter/number keys don't need
+# brackets, e.g. "<ctrl>+<alt>+h" is valid as-is.
+#
+# Toggle mode only (press once to start recording, press again to stop) —
+# not push-to-talk. Reliably tracking a held combo while you speak a full
+# sentence is meaningfully more complex and harder to get right without
+# a mic in front of me to test against; toggle is simpler and more
+# predictable. Worth revisiting if toggle turns out to feel awkward.
+VOICE_HOTKEY: str = os.getenv("VOICE_HOTKEY", "<ctrl>+<alt>+<space>")
+
+# faster-whisper model size — tiny/base/small/medium/large-v3. Bigger
+# means more accurate transcription and a bigger one-time download, and
+# slower per-utterance transcription on CPU. "base" is a reasonable
+# starting point; bump to "small" if transcription accuracy is the
+# bottleneck, drop to "tiny" if latency is.
+WHISPER_MODEL_SIZE: str = os.getenv("WHISPER_MODEL_SIZE", "base")
+
+# "cpu" or "cuda" (if you have a supported NVIDIA GPU + CTranslate2's CUDA
+# build installed). int8 compute type keeps CPU transcription reasonably
+# fast at a small accuracy cost — switch to "float16"/"float32" on GPU.
+WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE_TYPE: str = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+
+# Whisper expects 16kHz mono audio — don't change this unless you know
+# you need to feed it something else.
+VOICE_SAMPLE_RATE: int = int(os.getenv("VOICE_SAMPLE_RATE", "16000"))
+
+# Safety cap: if the stop-hotkey is somehow missed (app crash, you forget
+# you're still recording), don't record forever — stop and transcribe
+# whatever's been captured once this many seconds pass.
+VOICE_MAX_RECORDING_SECONDS: int = int(os.getenv("VOICE_MAX_RECORDING_SECONDS", "60"))

@@ -20,6 +20,17 @@ dependencies = [
     "uiautomation>=2.0.18",
 ]
 
+[project.optional-dependencies]
+# Phase 8 — Voice + Hotkey Trigger. Only needed if VOICE_ENABLED=true.
+# Install with: pip install -e .[voice]
+voice = [
+    "faster-whisper>=1.0.0",
+    "sounddevice>=0.4.6",
+    "pynput>=1.7.6",
+    "pystray>=0.19.5",
+    "numpy>=1.24",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
