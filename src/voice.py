@@ -1,41 +1,47 @@
 """
 Phase 8 — Voice + Hotkey Trigger.
+Phase 9 — Wake Word Detection ("hey jarvis"), layered on top.
 
 Local speech-to-text (faster-whisper) combined with a global hotkey
-listener (pynput) and a system tray icon (pystray), replacing the
-terminal input() loop entirely when VOICE_ENABLED=true. Orthogonal to
-every other phase — this module and main.py's entry point are the only
-things that changed.
+listener (pynput), always-on wake-word detection (openWakeWord, Phase 9),
+and a system tray icon (pystray), replacing the terminal input() loop
+entirely when VOICE_ENABLED=true.
 
-Flow:
-  1. Press VOICE_HOTKEY to start recording (toggle mode — not
-     push-to-talk; see VOICE_HOTKEY's config comment for why).
-  2. Speak your task.
-  3. Press the same hotkey again to stop.
-  4. Audio is transcribed locally via faster-whisper — no network call,
-     no cloud STT service.
-  5. The transcribed text is handed to the on_task callback main.py
-     supplies, which runs it through the exact same graph.invoke()
-     pipeline the text REPL uses — voice is just a different way to
-     produce a task string; nothing downstream changes.
+Two ways to start a recording:
+  1. Hotkey (Phase 8) — press VOICE_HOTKEY to start, press it again to
+     stop (toggle mode, manual on both ends).
+  2. Wake word (Phase 9, opt-in via WAKE_WORD_ENABLED) — say "hey jarvis"
+     any time the agent is idle. A short confirmation beep plays, then
+     it records automatically and stops itself once you pause speaking
+     (silence-based auto-stop) — you never touch anything.
 
-Requires: faster-whisper, sounddevice, pynput, pystray, numpy — NOT in
-the base dependency list (see pyproject.toml's 'voice' extras group),
-since they pull in extra system-level requirements (PortAudio for
-sounddevice, a Whisper model download) that most users of this agent
-via the terminal won't need. Only imported when VOICE_ENABLED=true.
+Either way, once a recording stops: audio is transcribed locally via
+faster-whisper (no cloud STT call), and the transcribed text is handed
+to the on_task callback main.py supplies, which runs it through the
+exact same graph.invoke() pipeline the text REPL uses — voice is just a
+different way to produce a task string; nothing downstream changes.
+
+Mic access is exclusive — only one audio stream runs at a time. See
+WAKE_WORD_ENABLED's config comment for the full exclusivity/ordering
+rules between wake-word listening, hotkey recording, and task execution.
+
+Requires: faster-whisper, sounddevice, pynput, pystray, numpy, and
+(only if WAKE_WORD_ENABLED) openwakeword — NOT in the base dependency
+list (see pyproject.toml's 'voice' extras group). Only imported when
+VOICE_ENABLED=true.
 
 IMPORTANT — testing limitations: this module was written and reviewed
 without access to a microphone, a display for the tray icon, or a real
 hotkey-capable OS session (built and verified in a sandboxed Linux
-container). The faster-whisper API shape, sounddevice's InputStream
-pattern, and pynput's GlobalHotKeys format were all verified against
-current documentation, and everything here is written as defensively
-as I can manage without hands-on testing — but this phase needs real
-verification on your machine more than any prior phase did. Expect to
-iterate on VOICE_HOTKEY (in case of a conflict with another app),
-WHISPER_MODEL_SIZE (speed vs. accuracy), and possibly the toggle
-behavior itself once you've actually used it.
+container). Every third-party API used here (faster-whisper,
+sounddevice's InputStream, pynput's GlobalHotKeys, openWakeWord's Model)
+was verified against current documentation and, where possible, exercised
+with synthetic data and fakes standing in for real hardware — but this
+phase needs real verification on your machine more than code review
+alone can provide. In particular, WAKE_WORD_SILENCE_RMS_THRESHOLD and
+WAKE_WORD_SILENCE_TIMEOUT_S (Phase 9's auto-stop) are mic- and
+room-dependent and were never tunable against real audio anywhere in
+this build — treat their defaults as a starting guess.
 """
 import logging
 import threading
@@ -49,6 +55,16 @@ from src.config import (
     WHISPER_COMPUTE_TYPE,
     VOICE_SAMPLE_RATE,
     VOICE_MAX_RECORDING_SECONDS,
+    WAKE_WORD_ENABLED,
+    WAKE_WORD_MODEL,
+    WAKE_WORD_THRESHOLD,
+    WAKE_WORD_SILENCE_RMS_THRESHOLD,
+    WAKE_WORD_SILENCE_TIMEOUT_S,
+    WAKE_WORD_MIN_SPEECH_S,
+    WAKE_WORD_MAX_RECORDING_SECONDS,
+    WAKE_WORD_MIC_GAIN,
+    VOICE_DEVICE_INDEX,
+    WAKE_WORD_SPEAKER_THRESHOLD,
 )
 
 log = logging.getLogger(__name__)
@@ -69,20 +85,24 @@ def check_voice_dependencies() -> None:
     be pip-installed but still fail to import for a system-level reason
     — e.g. sounddevice imports fine as a Python package but raises
     OSError('PortAudio library not found') if the underlying PortAudio
-    C library isn't present on the system. Reporting "not installed" for
-    that case would send someone down the wrong troubleshooting path
-    (re-running pip install, which "succeeds" and changes nothing) — so
-    each failure's actual message is captured and shown instead of a
-    generic one.
+    C library isn't present on the system, or pystray needs a GTK
+    backend on Linux. Reporting "not installed" for either case would
+    send someone down the wrong troubleshooting path (re-running pip
+    install, which "succeeds" and changes nothing) — so each failure's
+    actual message is captured and shown instead of a generic one.
     """
-    problems = []
-    for module_name, pip_name in [
+    checks = [
         ("faster_whisper", "faster-whisper"),
         ("sounddevice", "sounddevice"),
         ("pynput", "pynput"),
         ("pystray", "pystray"),
         ("numpy", "numpy"),
-    ]:
+    ]
+    if WAKE_WORD_ENABLED:
+        checks.append(("openwakeword", "openwakeword"))
+
+    problems = []
+    for module_name, pip_name in checks:
         try:
             __import__(module_name)
         except Exception as e:
@@ -119,6 +139,24 @@ def check_voice_dependencies() -> None:
         raise VoiceDependencyError("\n".join(lines))
 
 
+def _play_wake_chime() -> None:
+    """
+    Best-effort audible confirmation that the wake word was heard —
+    stands in for the "asks you what to do" behavior a real voice
+    assistant would give, without building a full text-to-speech
+    pipeline (a much bigger separate feature). winsound is part of
+    Python's standard library on Windows — this codebase is already
+    Windows-only (pywin32, uiautomation, pycaw), so this adds no new
+    dependency. Never let a failure here interrupt the actual recording
+    flow — it's a nice-to-have cue, not load-bearing.
+    """
+    try:
+        import winsound
+        winsound.Beep(880, 150)
+    except Exception as e:
+        log.debug("Wake chime failed (non-fatal): %s", e)
+
+
 class _Status:
     IDLE = "idle"
     RECORDING = "recording"
@@ -147,11 +185,14 @@ def _make_icon_image(status: str):
 
 class VoiceController:
     """
-    Owns the audio recording buffer, the Whisper model, the hotkey
-    listener, and the tray icon. Toggle mode only.
+    Owns the audio recording buffer, the Whisper model, the wake-word
+    detector, the hotkey listener, and the tray icon.
 
     on_task(text) is called with the transcribed task string every time
-    a recording completes with non-empty text.
+    a recording completes with non-empty text. Called synchronously and
+    BLOCKS until it returns (main.py's _run_task() blocks on
+    graph.invoke()) — this is relied on deliberately, see
+    _transcribe_and_dispatch's docstring for why.
     """
 
     def __init__(self, on_task: Callable[[str], None]):
@@ -159,11 +200,25 @@ class VoiceController:
 
         self._on_task = on_task
 
+        # -- shared recording state (hotkey- and wakeword-triggered both
+        #    go through the same _start_recording/_stop_recording_and_process) --
         self._recording = False
+        self._active_trigger: Optional[str] = None  # "hotkey" | "wakeword"
+        self._task_running = False
         self._audio_chunks: list = []
         self._record_lock = threading.Lock()
         self._stream = None
         self._record_start_time: Optional[float] = None
+
+        # -- Phase 9: silence-based auto-stop bookkeeping (wakeword only) --
+        self._heard_speech_since: Optional[float] = None
+        self._last_loud_time: Optional[float] = None
+
+        # -- Phase 9: wake-word listening stream (separate from the
+        #    above recording stream — only one of the two is ever
+        #    active at a time, see module docstring) --
+        self._wakeword_stream = None
+        self._wakeword_detector = None
 
         self._icon = None
         # Lazy-loaded on first recording, not at construction — avoids
@@ -171,6 +226,8 @@ class VoiceController:
         # longer on first run if it needs to download) before the tray
         # icon even appears, so startup feels immediate.
         self._model = None
+        self._cached_meter = None
+        self._last_suppression_log_time = 0.0
 
     # -- Whisper -------------------------------------------------------
 
@@ -193,7 +250,7 @@ class VoiceController:
     def _transcribe(self, audio) -> str:
         model = self._get_model()
         # vad_filter=True: Whisper is known to hallucinate phantom text
-        # during silence (e.g. the moment between pressing the hotkey
+        # during silence (e.g. the moment between triggering a recording
         # and actually starting to speak) — voice activity detection
         # trims that out before transcription runs on it.
         segments, _info = model.transcribe(
@@ -206,27 +263,49 @@ class VoiceController:
         )
         return " ".join(seg.text.strip() for seg in segments).strip()
 
-    # -- Audio -----------------------------------------------------------
+    # -- Recording audio (shared by both trigger paths) ------------------
 
     def _audio_callback(self, indata, frames, time_info, status):
         if status:
             log.warning("Audio input status: %s", status)
-        with self._record_lock:
-            if self._recording:
-                self._audio_chunks.append(indata.copy())
 
-    def _start_recording(self):
+        with self._record_lock:
+            if not self._recording:
+                return
+            self._audio_chunks.append(indata.copy())
+            is_wakeword_triggered = self._active_trigger == "wakeword"
+
+        if is_wakeword_triggered:
+            # Real-time energy check for Phase 9's silence-based
+            # auto-stop — deliberately a simple RMS threshold, not
+            # Whisper's own (much more accurate) vad_filter, which only
+            # runs after the fact on the complete recording and so can't
+            # be used to decide WHEN to stop in the first place.
+            import numpy as np
+            rms = float(np.sqrt(np.mean(indata.astype("float64") ** 2)))
+            if rms >= WAKE_WORD_SILENCE_RMS_THRESHOLD:
+                now = time.monotonic()
+                with self._record_lock:
+                    self._last_loud_time = now
+                    if self._heard_speech_since is None:
+                        self._heard_speech_since = now
+
+    def _start_recording(self, trigger: str = "hotkey"):
         import sounddevice as sd
 
         with self._record_lock:
-            if self._recording:
+            if self._recording or self._task_running:
                 return
             self._audio_chunks = []
             self._recording = True
+            self._active_trigger = trigger
             self._record_start_time = time.monotonic()
+            self._heard_speech_since = None
+            self._last_loud_time = time.monotonic()
 
         try:
             self._stream = sd.InputStream(
+                device=VOICE_DEVICE_INDEX,
                 samplerate=VOICE_SAMPLE_RATE,
                 channels=1,
                 dtype="float32",
@@ -240,25 +319,69 @@ class VoiceController:
             log.error("Could not start audio recording: %s", e)
             with self._record_lock:
                 self._recording = False
+                self._active_trigger = None
             self._set_status(_Status.IDLE)
+            if trigger == "wakeword":
+                self._start_wakeword_listening()
             return
 
         self._set_status(_Status.RECORDING)
-        log.info("Recording started — press %s again to stop", VOICE_HOTKEY)
 
-        # Safety cap so a missed stop-hotkey doesn't record forever.
-        threading.Thread(target=self._auto_stop_watchdog, daemon=True).start()
+        if trigger == "wakeword":
+            log.info(
+                "Recording started (wake word) — will stop automatically "
+                "once you pause, or after %ds regardless",
+                WAKE_WORD_MAX_RECORDING_SECONDS,
+            )
+            threading.Thread(target=self._silence_watchdog, daemon=True).start()
+            max_seconds = WAKE_WORD_MAX_RECORDING_SECONDS
+        else:
+            log.info("Recording started — press %s again to stop", VOICE_HOTKEY)
+            max_seconds = VOICE_MAX_RECORDING_SECONDS
 
-    def _auto_stop_watchdog(self):
-        time.sleep(VOICE_MAX_RECORDING_SECONDS)
+        threading.Thread(
+            target=self._auto_stop_watchdog, args=(max_seconds,), daemon=True
+        ).start()
+
+    def _auto_stop_watchdog(self, max_seconds: float):
+        """Safety cap for BOTH trigger paths — if the stop condition
+        (hotkey press, or silence for the wakeword path) is somehow
+        missed, don't record forever."""
+        time.sleep(max_seconds)
         with self._record_lock:
             still_recording = self._recording
         if still_recording:
             log.warning(
-                "Hit VOICE_MAX_RECORDING_SECONDS=%ds without a stop — "
-                "stopping automatically", VOICE_MAX_RECORDING_SECONDS,
+                "Hit the %ds recording cap without a stop condition — "
+                "stopping automatically", max_seconds,
             )
             self._stop_recording_and_process()
+
+    def _silence_watchdog(self):
+        """
+        Phase 9 only: polls for silence following speech and auto-stops
+        a wakeword-triggered recording. Hotkey-triggered recordings are
+        never touched by this — they stop only on an explicit second
+        hotkey press (or the shared max-duration cap above).
+        """
+        poll_interval_s = 0.1
+        while True:
+            time.sleep(poll_interval_s)
+            with self._record_lock:
+                if not self._recording or self._active_trigger != "wakeword":
+                    return  # recording ended some other way, or wasn't ours to watch
+                heard_speech_since = self._heard_speech_since
+                last_loud = self._last_loud_time
+
+            now = time.monotonic()
+            if heard_speech_since is None:
+                continue  # hasn't heard any speech above the RMS threshold yet
+            if now - heard_speech_since < WAKE_WORD_MIN_SPEECH_S:
+                continue  # require a minimum amount of speech before allowing auto-stop
+            if last_loud is not None and now - last_loud >= WAKE_WORD_SILENCE_TIMEOUT_S:
+                log.info("Silence detected after speech — stopping recording")
+                self._stop_recording_and_process()
+                return
 
     def _stop_recording_and_process(self):
         with self._record_lock:
@@ -267,6 +390,8 @@ class VoiceController:
             self._recording = False
             chunks = self._audio_chunks
             self._audio_chunks = []
+            trigger = self._active_trigger
+            self._active_trigger = None
 
         if self._stream is not None:
             try:
@@ -282,21 +407,46 @@ class VoiceController:
         if not chunks:
             log.warning("No audio captured — nothing to transcribe")
             self._set_status(_Status.IDLE)
+            if trigger == "wakeword":
+                self._start_wakeword_listening()
             return
 
         self._set_status(_Status.PROCESSING)
 
-        # Off the hotkey-callback thread so a slow CPU transcription
-        # doesn't block the listener from noticing the next hotkey press
-        # (e.g. to start a fresh recording while this one's still
-        # processing — see the module docstring's testing-limitations
-        # note: this is one of the interaction edges I couldn't verify
-        # hands-on and would want confirmed on real hardware).
+        # Off the calling thread (hotkey callback or silence-watchdog
+        # thread) so a slow CPU transcription doesn't block either from
+        # being responsive.
         threading.Thread(
-            target=self._transcribe_and_dispatch, args=(chunks,), daemon=True
+            target=self._transcribe_and_dispatch, args=(chunks, trigger), daemon=True
         ).start()
 
-    def _transcribe_and_dispatch(self, chunks):
+    def _transcribe_and_dispatch(self, chunks, trigger: Optional[str]):
+        import pythoncom
+        pythoncom.CoInitialize()
+        try:
+            self._transcribe_and_dispatch_inner(chunks, trigger)
+        finally:
+            pythoncom.CoUninitialize()
+
+    def _transcribe_and_dispatch_inner(self, chunks, trigger: Optional[str]):
+        """
+        trigger is only used here to know whether to resume wake-word
+        listening afterward (only relevant if it was wakeword-triggered
+        or if wake-word listening should generally resume once idle —
+        see the resume calls below, which fire regardless of trigger so
+        a hotkey-triggered task still lets wake-word listening resume
+        once it's done).
+
+        IMPORTANT: self._on_task(text) is called synchronously here and
+        blocks until it returns — main.py's _run_task() blocks on
+        graph.invoke(). This is relied on deliberately: wake-word
+        listening and the hotkey's ability to START a new recording are
+        both gated on self._task_running, which stays True for exactly
+        the duration of this blocking call. That's what prevents a wake
+        word overheard mid-task (or an accidental hotkey press) from
+        starting a second, overlapping graph.invoke() — see
+        WAKE_WORD_ENABLED's config comment for the full reasoning.
+        """
         import numpy as np
 
         try:
@@ -305,29 +455,179 @@ class VoiceController:
         except Exception as e:
             log.error("Transcription failed: %s", e, exc_info=True)
             self._set_status(_Status.IDLE)
+            self._start_wakeword_listening()
             return
 
         self._set_status(_Status.IDLE)
 
         if not text:
             log.warning("Transcription produced no text — nothing to run")
+            self._start_wakeword_listening()
             return
 
         log.info("Transcribed: %s", text)
+
+        with self._record_lock:
+            self._task_running = True
         try:
             self._on_task(text)
         except Exception as e:
             log.error("Task callback raised: %s", e, exc_info=True)
+        finally:
+            with self._record_lock:
+                self._task_running = False
+            # Resume wake-word listening only now that the task has
+            # fully finished — never while recording, transcribing, or
+            # running a task. See this method's docstring.
+            self._start_wakeword_listening()
 
     # -- Hotkey toggle -----------------------------------------------------
 
     def _on_hotkey(self):
         with self._record_lock:
             currently_recording = self._recording
+            task_running = self._task_running
+
+        if task_running and not currently_recording:
+            log.info("A task is already running — ignoring hotkey until it finishes")
+            return
+
         if currently_recording:
             self._stop_recording_and_process()
         else:
-            self._start_recording()
+            self._start_recording(trigger="hotkey")
+
+    # -- Wake word (Phase 9) ------------------------------------------------
+
+    def _get_speaker_meter(self):
+        if self._cached_meter is not None:
+            return self._cached_meter
+        try:
+            from pycaw.pycaw import AudioUtilities, IAudioMeterInformation
+            from ctypes import POINTER, cast
+            from comtypes import CLSCTX_ALL
+
+            speakers = AudioUtilities.GetSpeakers()
+            if speakers and speakers._dev:
+                iface = speakers._dev.Activate(IAudioMeterInformation._iid_, CLSCTX_ALL, None)
+                self._cached_meter = cast(iface, POINTER(IAudioMeterInformation))
+                return self._cached_meter
+        except Exception as e:
+            log.debug("Failed to initialize speaker meter: %s", e)
+        self._cached_meter = None
+        return None
+
+    def _get_wakeword_detector(self):
+        if self._wakeword_detector is None:
+            from src.wakeword import WakeWordDetector
+            self._wakeword_detector = WakeWordDetector()
+        return self._wakeword_detector
+
+    def _wakeword_audio_callback(self, indata, frames, time_info, status):
+        if status:
+            log.warning("Wake word audio input status: %s", status)
+
+        with self._record_lock:
+            if self._recording or self._task_running:
+                return  # busy — ignore, don't trigger a second overlapping task
+
+        # Check system audio playback to prevent self-triggering loop
+        if WAKE_WORD_SPEAKER_THRESHOLD > 0.0:
+            try:
+                meter = self._get_speaker_meter()
+                if meter is not None:
+                    peak = meter.GetPeakValue()
+                    if peak >= WAKE_WORD_SPEAKER_THRESHOLD:
+                        now = time.monotonic()
+                        if now - self._last_suppression_log_time >= 5.0:
+                            log.info(
+                                "System audio playback detected (peak=%.3f) — suppressing wake word detection to avoid self-triggering loop",
+                                peak
+                            )
+                            self._last_suppression_log_time = now
+                        return
+            except Exception as e:
+                log.debug("COM error reading speaker meter: %s", e)
+                self._cached_meter = None
+
+        try:
+            import numpy as np
+            detector = self._get_wakeword_detector()
+            chunk = indata[:, 0]
+            # Apply software gain — many laptop mic arrays produce very
+            # low-level signals that the model can't score without
+            # amplification. Clip to [-1, 1] after gain to avoid
+            # distortion artifacts that could confuse the model.
+            if WAKE_WORD_MIC_GAIN != 1.0:
+                chunk = np.clip(chunk * WAKE_WORD_MIC_GAIN, -1.0, 1.0)
+            scores = detector.predict(chunk)
+        except Exception as e:
+            log.error("Wake word prediction failed: %s", e)
+            return
+
+        for name, score in scores.items():
+            if score >= WAKE_WORD_THRESHOLD:
+                log.info("Wake word '%s' detected (score=%.2f)", name, score)
+                # Stop wake-word listening immediately: only one audio
+                # stream at a time, and this also prevents re-triggering
+                # repeatedly on the same utterance while we transition
+                # into recording.
+                self._stop_wakeword_listening()
+                _play_wake_chime()
+                self._notify("Yes? Listening...")
+                self._start_recording(trigger="wakeword")
+                return  # only act on the first hit in this chunk
+
+    def _start_wakeword_listening(self):
+        if not WAKE_WORD_ENABLED:
+            return
+
+        with self._record_lock:
+            if self._recording or self._task_running:
+                return  # don't resume while busy — the caller that
+                         # finishes being busy is responsible for
+                         # calling this again afterward
+
+        if self._wakeword_stream is not None:
+            return  # already listening
+
+        import sounddevice as sd
+        from src.wakeword import WAKE_WORD_CHUNK_SAMPLES
+
+        try:
+            self._get_wakeword_detector()  # load eagerly here, not on
+                                            # first chunk, so the delay
+                                            # happens once at startup
+                                            # rather than stalling the
+                                            # first real "hey jarvis"
+            self._wakeword_stream = sd.InputStream(
+                device=VOICE_DEVICE_INDEX,
+                samplerate=VOICE_SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                blocksize=WAKE_WORD_CHUNK_SAMPLES,
+                callback=self._wakeword_audio_callback,
+            )
+            self._wakeword_stream.start()
+            log.info(
+                "Wake word listening active ('%s', threshold=%.2f)",
+                WAKE_WORD_MODEL, WAKE_WORD_THRESHOLD,
+            )
+        except Exception as e:
+            log.error(
+                "Could not start wake word listening: %s — wake word "
+                "disabled for this session, the hotkey still works", e,
+            )
+            self._wakeword_stream = None
+
+    def _stop_wakeword_listening(self):
+        if self._wakeword_stream is not None:
+            try:
+                self._wakeword_stream.stop()
+                self._wakeword_stream.close()
+            except Exception:
+                pass
+            self._wakeword_stream = None
 
     # -- Tray icon --------------------------------------------------------
 
@@ -341,9 +641,59 @@ class VoiceController:
                 # here take down actual recording/transcription.
                 log.debug("Tray icon update failed (non-fatal): %s", e)
 
+    def _notify(self, message: str, title: str = "Computer-Use Agent"):
+        """
+        Best-effort OS-level notification via the tray icon (a real
+        Windows toast/balloon on pystray's Windows backend) — added so
+        there's a clear, visible signal for "the agent has started and
+        is listening" and "I heard the wake word," beyond just a
+        terminal log line someone running this in the background won't
+        see. Never let a failure here — unsupported platform, a backend
+        quirk — break the actual voice flow: the terminal log and (for
+        wake-word detection specifically) the audible beep are the
+        load-bearing confirmations; this is a nice-to-have on top.
+        """
+        if self._icon is None:
+            return
+        try:
+            if getattr(self._icon, "HAS_NOTIFICATION", False):
+                self._icon.notify(message, title)
+            else:
+                log.debug("Tray notifications not supported on this platform/backend")
+        except Exception as e:
+            log.debug("Tray notification failed (non-fatal): %s", e)
+
     def _on_quit(self, icon, item):
         log.info("Voice mode: quitting")
         icon.stop()
+
+    def _on_tray_ready(self, icon):
+        """
+        pystray's run(setup=...) callback — fires once in a separate
+        thread after the event loop has actually started, meaning the
+        icon is genuinely visible in the system tray by this point (not
+        just constructed). Providing a custom setup function means we're
+        responsible for setting icon.visible ourselves — pystray's
+        default setup (used when no setup= is given) does this
+        automatically, a custom one must replicate it.
+        """
+        icon.visible = True
+
+        if WAKE_WORD_ENABLED:
+            ready_message = f'Ready — say "hey jarvis" or press {VOICE_HOTKEY} to start a task.'
+        else:
+            ready_message = f"Ready — press {VOICE_HOTKEY} to start a task."
+        self._notify(ready_message)
+
+        if WAKE_WORD_ENABLED:
+            self._start_wakeword_listening()
+
+        wake_word_note = ', or say "hey jarvis"' if WAKE_WORD_ENABLED else ""
+        log.info(
+            "Voice mode active — press %s to start/stop recording a task%s, "
+            "or use the tray icon's Quit to exit",
+            VOICE_HOTKEY, wake_word_note,
+        )
 
     def run(self):
         """
@@ -367,15 +717,11 @@ class VoiceController:
             ),
         )
 
-        log.info(
-            "Voice mode active — press %s to start/stop recording a task, "
-            "or use the tray icon's Quit to exit",
-            VOICE_HOTKEY,
-        )
         try:
-            self._icon.run()  # blocks until Quit
+            self._icon.run(setup=self._on_tray_ready)  # blocks until Quit
         finally:
             listener.stop()
+            self._stop_wakeword_listening()
             if self._stream is not None:
                 try:
                     self._stream.stop()
