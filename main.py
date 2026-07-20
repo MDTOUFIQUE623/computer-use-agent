@@ -86,13 +86,16 @@ def _cdp_preflight() -> bool:
 # ---------------------------------------------------------------------------
 
 def _print_banner():
-    from src.config import BROWSER_MODE, CDP_URL, CDP_TAB_POLICY, VOICE_ENABLED, VOICE_HOTKEY
+    from src.config import (
+        BROWSER_MODE, CDP_URL, CDP_TAB_POLICY,
+        VOICE_ENABLED, VOICE_HOTKEY, WAKE_WORD_ENABLED, WAKE_WORD_MODEL,
+    )
 
     mode = BROWSER_MODE.lower()
 
     print()
     print("╔══════════════════════════════════════════════════════╗")
-    print("║         Computer-Use Agent  —  Phase 8 (Voice)      ║")
+    print("║      Computer-Use Agent  —  Phase 9 (Wake Word)     ║")
     print("╚══════════════════════════════════════════════════════╝")
     print()
 
@@ -112,10 +115,19 @@ def _print_banner():
     print()
 
     if VOICE_ENABLED:
-        print(f"  Input mode   : VOICE  (hotkey: {VOICE_HOTKEY})")
-        print()
-        print(f"  Press {VOICE_HOTKEY} to start/stop recording a task.")
-        print("  Use the system tray icon's Quit to exit.")
+        if WAKE_WORD_ENABLED:
+            wake_phrase = WAKE_WORD_MODEL.replace("_", " ")
+            print(f"  Input mode   : VOICE  (hotkey: {VOICE_HOTKEY}, wake word: \"{wake_phrase}\")")
+            print()
+            print(f"  Say \"{wake_phrase}\" any time, or press {VOICE_HOTKEY}, to start a task.")
+            print("  Wake-word recordings stop automatically once you pause speaking.")
+            print("  Use the system tray icon's Quit to exit.")
+        else:
+            print(f"  Input mode   : VOICE  (hotkey: {VOICE_HOTKEY})")
+            print()
+            print(f"  Press {VOICE_HOTKEY} to start/stop recording a task.")
+            print("  Set WAKE_WORD_ENABLED=true in .env to add hands-free \"hey jarvis\" activation.")
+            print("  Use the system tray icon's Quit to exit.")
     else:
         print("  Input mode   : TEXT")
         print()

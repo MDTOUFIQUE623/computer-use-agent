@@ -22,6 +22,8 @@ dependencies = [
 
 [project.optional-dependencies]
 # Phase 8 — Voice + Hotkey Trigger. Only needed if VOICE_ENABLED=true.
+# Phase 9 — adds openwakeword for wake-word detection ("hey jarvis"),
+# only needed if WAKE_WORD_ENABLED=true (on top of VOICE_ENABLED=true).
 # Install with: pip install -e .[voice]
 voice = [
     "faster-whisper>=1.0.0",
@@ -29,6 +31,7 @@ voice = [
     "pynput>=1.7.6",
     "pystray>=0.19.5",
     "numpy>=1.24",
+    "openwakeword>=0.6.0",
 ]
 
 [dependency-groups]

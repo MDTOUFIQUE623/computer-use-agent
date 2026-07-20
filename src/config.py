@@ -332,7 +332,102 @@ WHISPER_COMPUTE_TYPE: str = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 # you need to feed it something else.
 VOICE_SAMPLE_RATE: int = int(os.getenv("VOICE_SAMPLE_RATE", "16000"))
 
+# Optional input device index. If set to an integer, explicitly tells
+# sounddevice to use that device instead of PortAudio's default choice.
+VOICE_DEVICE_INDEX: Optional[int] = (
+    int(os.getenv("VOICE_DEVICE_INDEX")) if os.getenv("VOICE_DEVICE_INDEX") else None
+)
+
 # Safety cap: if the stop-hotkey is somehow missed (app crash, you forget
 # you're still recording), don't record forever — stop and transcribe
 # whatever's been captured once this many seconds pass.
 VOICE_MAX_RECORDING_SECONDS: int = int(os.getenv("VOICE_MAX_RECORDING_SECONDS", "60"))
+
+# ---------------------------------------------------------------------------
+# Phase 9 — Wake Word Detection
+# ---------------------------------------------------------------------------
+#
+# WAKE_WORD_ENABLED adds always-on "hey jarvis" listening on top of
+# Phase 8's voice mode — only takes effect when VOICE_ENABLED=true (it's
+# an additional trigger alongside the hotkey, not a replacement for it;
+# the hotkey keeps working as a manual fallback at all times, including
+# as a way to start a task without saying the wake word out loud).
+#
+# Mic access is exclusive: only one audio stream runs at a time. While
+# idle, that's the wake-word-listening stream; the moment a recording
+# starts (wake word OR hotkey), the wake-word stream stops, and it only
+# resumes once the whole task (recording -> transcription -> execution)
+# has fully finished — deliberately not listening for a fresh wake word
+# mid-task, so you can't accidentally trigger two overlapping tasks by
+# being overheard while the first is still running. The hotkey is
+# likewise ignored (with a log message, not silently) if a task is
+# already in flight, for the same reason.
+WAKE_WORD_ENABLED: bool = os.getenv("WAKE_WORD_ENABLED", "false").lower() == "true"
+
+# openWakeWord's bundled pretrained model name. "hey_jarvis" ships with
+# the package — no custom training needed. Per openWakeWord's own docs,
+# a short pause after the wake phrase improves detection reliability.
+WAKE_WORD_MODEL: str = os.getenv("WAKE_WORD_MODEL", "hey_jarvis")
+
+# Score (0.0-1.0) a chunk needs to hit to count as a detection. 0.5 is
+# openWakeWord's own recommended default for its pretrained models —
+# raise it if you get false triggers from background noise/TV/etc,
+# lower it if it's missing real "hey jarvis" attempts.
+WAKE_WORD_THRESHOLD: float = float(os.getenv("WAKE_WORD_THRESHOLD", "0.5"))
+
+# Wires in openWakeWord's built-in Silero VAD as an extra gate — a
+# wake-word score only counts if the VAD model simultaneously scores
+# actual speech (not just noise) above this threshold on the same
+# frame. Meaningfully reduces false-accepts from non-speech sounds in
+# an always-on continuous-listening setup like this one.
+WAKE_WORD_VAD_THRESHOLD: float = float(os.getenv("WAKE_WORD_VAD_THRESHOLD", "0.5"))
+
+# --- auto-stop after the wake word (silence-based, not toggle) ---
+#
+# IMPORTANT: unlike Phase 8's hotkey path, these were NOT tunable
+# against a real microphone anywhere in this build — RMS/silence
+# thresholds are extremely mic- and room-dependent, and this needs
+# hands-on calibration on your machine far more than any other number
+# in this file. Treat the defaults below as a starting guess, not a
+# verified value.
+
+# RMS amplitude (float32 audio, range [-1, 1]) above which a chunk
+# counts as "someone is speaking" for auto-stop purposes. This is a
+# simple, fast, real-time-safe energy check — deliberately NOT the same
+# thing as Whisper's own vad_filter (a much more accurate model-based
+# VAD), which only runs after the fact on the complete recording and so
+# can't be used to decide WHEN to stop recording in the first place.
+WAKE_WORD_SILENCE_RMS_THRESHOLD: float = float(
+    os.getenv("WAKE_WORD_SILENCE_RMS_THRESHOLD", "0.02")
+)
+
+# How long silence (below the RMS threshold above) must persist after
+# some speech was heard before auto-stopping and transcribing.
+WAKE_WORD_SILENCE_TIMEOUT_S: float = float(os.getenv("WAKE_WORD_SILENCE_TIMEOUT_S", "1.5"))
+
+# Minimum duration of detected speech required before the silence-timeout
+# is allowed to fire — guards against a single loud blip (a cough, a
+# door) triggering an instant stop right after the wake word.
+WAKE_WORD_MIN_SPEECH_S: float = float(os.getenv("WAKE_WORD_MIN_SPEECH_S", "0.6"))
+
+# Safety cap for wake-word-triggered recordings specifically — shorter
+# than VOICE_MAX_RECORDING_SECONDS (Phase 8's hotkey cap) since
+# silence-detection should normally stop it well before this in normal
+# use; this is only a backstop if silence-detection somehow never fires.
+WAKE_WORD_MAX_RECORDING_SECONDS: int = int(os.getenv("WAKE_WORD_MAX_RECORDING_SECONDS", "20"))
+
+# Software gain multiplier applied to the microphone audio BEFORE feeding it
+# to the wake word model. Many laptop microphone arrays (e.g. Realtek)
+# produce very low-level float32 signals (RMS ~0.001-0.003 even during loud
+# speech) that never register with the wake word model's scoring. This
+# multiplier boosts the signal so the model can actually "hear" the audio.
+# Set to 1.0 to disable amplification. Higher values = more sensitive but
+# also more prone to false triggers from background noise.
+WAKE_WORD_MIC_GAIN: float = float(os.getenv("WAKE_WORD_MIC_GAIN", "10.0"))
+
+# Peak audio output level (0.0 - 1.0) above which wake-word listening is
+# paused to prevent the mic from hearing and self-triggering on the agent's
+# own speaker output (e.g., when playing music or TTS). Set to 0.0 to disable.
+WAKE_WORD_SPEAKER_THRESHOLD: float = float(
+    os.getenv("WAKE_WORD_SPEAKER_THRESHOLD", "0.01")
+)
