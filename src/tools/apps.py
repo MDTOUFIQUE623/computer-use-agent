@@ -1426,8 +1426,9 @@ class SystemTools:
                     duration_ms=_ms(start)
                 )
 
-            except ImportError:
-                # pycaw not available — use key presses as fallback
+            except Exception:
+                # pycaw not available or COM activation failed —
+                # use key presses as fallback
                 # Press mute twice to ensure unmuted, then adjust
                 pyautogui.press("volumemute")
                 time.sleep(0.1)
