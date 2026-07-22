@@ -431,3 +431,33 @@ WAKE_WORD_MIC_GAIN: float = float(os.getenv("WAKE_WORD_MIC_GAIN", "10.0"))
 WAKE_WORD_SPEAKER_THRESHOLD: float = float(
     os.getenv("WAKE_WORD_SPEAKER_THRESHOLD", "0.01")
 )
+
+# ---------------------------------------------------------------------------
+# Phase 10 — Native Desktop App
+# ---------------------------------------------------------------------------
+#
+# GUI_ENABLED replaces BOTH main.py's text loop and Phase 8/9's tray-icon
+# voice loop with a native window (pywebview, rendered via Windows'
+# built-in Edge WebView2 — no browser, no local web server, no separate
+# backend process; the UI and the agent run in the same Python process)
+# — see src/desktop_app.py. Takes priority over VOICE_ENABLED/text mode
+# when true; VOICE_ENABLED and WAKE_WORD_ENABLED still control whether
+# the GUI ALSO listens for the hotkey/wake word in the background (it
+# does by default) — the window doesn't replace those, it replaces the
+# system tray icon as the visible presence, and adds a text input box
+# and live progress view on top.
+GUI_ENABLED: bool = os.getenv("GUI_ENABLED", "false").lower() == "true"
+
+GUI_WINDOW_WIDTH: int = int(os.getenv("GUI_WINDOW_WIDTH", "1100"))
+GUI_WINDOW_HEIGHT: int = int(os.getenv("GUI_WINDOW_HEIGHT", "720"))
+
+# Where task history (task text, success/fail, timestamp, result preview)
+# is persisted between app restarts — a lightweight JSON file, not
+# another SQLite table, since this is small, append-mostly, and only
+# ever read/written by one process at a time.
+GUI_HISTORY_PATH: Path = BASE_DIR / "gui_task_history.json"
+
+# History list is capped at this many entries (oldest dropped) — mainly
+# to keep the file and the in-memory list from growing unbounded over
+# months of daily use, not because more would cause real problems.
+GUI_HISTORY_MAX_ENTRIES: int = int(os.getenv("GUI_HISTORY_MAX_ENTRIES", "200"))

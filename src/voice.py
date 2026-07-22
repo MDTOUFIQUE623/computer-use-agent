@@ -195,10 +195,19 @@ class VoiceController:
     _transcribe_and_dispatch's docstring for why.
     """
 
-    def __init__(self, on_task: Callable[[str], None]):
+    def __init__(
+        self,
+        on_task: Callable[[str], None],
+        on_status_change: Optional[Callable[[str], None]] = None,
+    ):
         check_voice_dependencies()
 
         self._on_task = on_task
+        # Phase 10: optional hook so a consumer without a tray icon (the
+        # desktop app) can still observe idle/recording/processing
+        # status changes — see _set_status(). None is a no-op, so this
+        # is fully backward compatible with Phase 8/9's tray-only usage.
+        self._on_status_change = on_status_change
 
         # -- shared recording state (hotkey- and wakeword-triggered both
         #    go through the same _start_recording/_stop_recording_and_process) --
@@ -219,6 +228,12 @@ class VoiceController:
         #    active at a time, see module docstring) --
         self._wakeword_stream = None
         self._wakeword_detector = None
+
+        # Phase 10: the hotkey listener is now stored on self (was a
+        # local variable inside run() before) so start_background_
+        # listening()/stop_background_listening() can manage it
+        # independently of whether a tray icon (run()) is involved at all.
+        self._hotkey_listener = None
 
         self._icon = None
         # Lazy-loaded on first recording, not at construction — avoids
@@ -641,6 +656,12 @@ class VoiceController:
                 # here take down actual recording/transcription.
                 log.debug("Tray icon update failed (non-fatal): %s", e)
 
+        if self._on_status_change is not None:
+            try:
+                self._on_status_change(status)
+            except Exception as e:
+                log.debug("Status change callback failed (non-fatal): %s", e)
+
     def _notify(self, message: str, title: str = "Computer-Use Agent"):
         """
         Best-effort OS-level notification via the tray icon (a real
@@ -667,6 +688,61 @@ class VoiceController:
         log.info("Voice mode: quitting")
         icon.stop()
 
+    def start_background_listening(self) -> None:
+        """
+        Non-blocking: starts the hotkey listener and (if
+        WAKE_WORD_ENABLED) wake-word listening — no tray icon, no
+        window, no other main-thread-owning loop. Safe to call at most
+        once per VoiceController instance.
+
+        Two callers:
+          - run() (Phase 8/9's tray-icon voice mode) calls this, then
+            additionally runs the tray icon's own blocking loop.
+          - Phase 10's desktop app (src/desktop_app.py) calls this once
+            at startup, then runs pywebview's blocking loop instead of
+            a tray icon — no tray icon is created in that mode at all,
+            the app window IS the visible presence.
+
+        Both pynput's GlobalHotKeys and sounddevice's InputStream run
+        their own background threads internally — neither needs to own
+        the calling thread, which is what makes this decomposition
+        possible. Only a tray icon's or a GUI window's own event loop
+        needs the main thread.
+        """
+        from pynput import keyboard
+
+        self._hotkey_listener = keyboard.GlobalHotKeys({VOICE_HOTKEY: self._on_hotkey})
+        self._hotkey_listener.start()
+
+        if WAKE_WORD_ENABLED:
+            self._start_wakeword_listening()
+
+        wake_word_note = ', or say "hey jarvis"' if WAKE_WORD_ENABLED else ""
+        log.info(
+            "Voice listening active — press %s to start/stop recording a task%s",
+            VOICE_HOTKEY, wake_word_note,
+        )
+
+    def stop_background_listening(self) -> None:
+        """Counterpart to start_background_listening() — stops the hotkey
+        listener, wake-word listening, and any in-progress recording stream."""
+        if self._hotkey_listener is not None:
+            try:
+                self._hotkey_listener.stop()
+            except Exception:
+                pass
+            self._hotkey_listener = None
+
+        self._stop_wakeword_listening()
+
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
     def _on_tray_ready(self, icon):
         """
         pystray's run(setup=...) callback — fires once in a separate
@@ -676,6 +752,11 @@ class VoiceController:
         responsible for setting icon.visible ourselves — pystray's
         default setup (used when no setup= is given) does this
         automatically, a custom one must replicate it.
+
+        Only handles tray-specific setup now — the actual hotkey/
+        wake-word listening is started separately by run() calling
+        start_background_listening() before the icon's event loop even
+        begins, so it's already active by the time this fires.
         """
         icon.visible = True
 
@@ -685,16 +766,6 @@ class VoiceController:
             ready_message = f"Ready — press {VOICE_HOTKEY} to start a task."
         self._notify(ready_message)
 
-        if WAKE_WORD_ENABLED:
-            self._start_wakeword_listening()
-
-        wake_word_note = ', or say "hey jarvis"' if WAKE_WORD_ENABLED else ""
-        log.info(
-            "Voice mode active — press %s to start/stop recording a task%s, "
-            "or use the tray icon's Quit to exit",
-            VOICE_HOTKEY, wake_word_note,
-        )
-
     def run(self):
         """
         Blocking — owns the calling thread. Call this from main.py's main
@@ -703,10 +774,8 @@ class VoiceController:
         pywin32/uiautomation, so keep this on the main thread regardless).
         """
         import pystray
-        from pynput import keyboard
 
-        listener = keyboard.GlobalHotKeys({VOICE_HOTKEY: self._on_hotkey})
-        listener.start()
+        self.start_background_listening()
 
         self._icon = pystray.Icon(
             "computer_use_agent",
@@ -720,14 +789,7 @@ class VoiceController:
         try:
             self._icon.run(setup=self._on_tray_ready)  # blocks until Quit
         finally:
-            listener.stop()
-            self._stop_wakeword_listening()
-            if self._stream is not None:
-                try:
-                    self._stream.stop()
-                    self._stream.close()
-                except Exception:
-                    pass
+            self.stop_background_listening()
 
 
 def run_voice_loop(on_task: Callable[[str], None]) -> None:

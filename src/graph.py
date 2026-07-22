@@ -1173,3 +1173,52 @@ def build_graph(with_supervisor: bool = True):
 # docstring for why workers use a separate, supervisor-less compilation).
 app = build_graph(with_supervisor=True)
 _worker_app = build_graph(with_supervisor=False)
+
+
+def run_task_sync(task: str) -> dict:
+    """
+    Run one task string through the top-level graph (app, with
+    supervisor) synchronously, returning the final state dict.
+
+    Phase 10: this is the single canonical way to invoke a task —
+    main.py's text/voice loops and the desktop app (src/desktop_app.py)
+    both call this rather than each building their own initial_state
+    dict and try/except handling, so the two surfaces can't quietly
+    drift apart over time the way two independent copies eventually do.
+    """
+    initial_state = {
+        "task":               task,
+        "plan":               None,
+        "current_step_index": 0,
+        "step_results":       [],
+        "retry_count":        0,
+        "is_done":            False,
+        "is_failed":          False,
+        "memory_hints":       None,
+        "last_error":         None,
+        "ask_user_message":   None,
+        "task_start_ms":      None,
+        "_last_tool_result":  None,
+        "_last_step_result":  None,
+        "slots":              None,
+        "_pending_subtasks":  None,
+        "_precomputed_plans": None,
+        "_precomputed_plan":  None,
+    }
+
+    try:
+        return app.invoke(initial_state)
+    except KeyboardInterrupt:
+        log.info("Task interrupted")
+        _close_browser_instance()
+        return {
+            "task": task, "is_done": True, "is_failed": True,
+            "last_error": "Interrupted", "slots": None,
+        }
+    except Exception as e:
+        log.error("Unhandled graph error: %s", e, exc_info=True)
+        _close_browser_instance()
+        return {
+            "task": task, "is_done": True, "is_failed": True,
+            "last_error": str(e), "slots": None,
+        }
