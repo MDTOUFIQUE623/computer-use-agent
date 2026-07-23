@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Computer-Use Agent</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="orb orb-idle" id="orb" aria-hidden="true"></span>
+        <div class="brand-text">
+          <h1>Computer-Use Agent</h1>
+          <span class="brand-sub" id="statusLabel">Idle</span>
+        </div>
+      </div>
+    </header>
+
+    <form class="composer" id="composer">
+      <input
+        type="text"
+        id="taskInput"
+        placeholder='Type a task, or say "hey jarvis"…'
+        autocomplete="off"
+        autofocus
+      />
+      <button type="submit" id="runButton">Run</button>
+    </form>
+
+    <main class="panels">
+      <section class="panel panel-log">
+        <div class="panel-header">
+          <span class="panel-title">Live</span>
+          <span class="panel-sub" id="currentTaskLabel"></span>
+        </div>
+        <div class="log-view" id="logView">
+          <p class="empty-state">No task running. Type above, or say &ldquo;hey jarvis&rdquo;.</p>
+        </div>
+      </section>
+
+      <section class="panel panel-history">
+        <div class="panel-header">
+          <span class="panel-title">History</span>
+        </div>
+        <div class="history-list" id="historyList">
+          <p class="empty-state">Nothing yet.</p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -34,6 +34,16 @@ voice = [
     "openwakeword>=0.6.0",
 ]
 
+# Phase 10 — Native Desktop App. Only needed if GUI_ENABLED=true.
+# On Windows, pywebview renders through the built-in Edge WebView2
+# runtime — no bundled Chromium/Node.js, no separate install needed
+# beyond what Windows already ships (or the WebView2 redistributable,
+# if it's ever genuinely missing). Combine with the voice extras
+# (pip install -e .[voice,gui]) for hands-free operation through the app.
+gui = [
+    "pywebview>=5.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",

@@ -209,3 +209,16 @@ class WakeWordDetector:
         if audio_chunk.dtype != np.int16:
             audio_chunk = (audio_chunk * 32767.0).astype(np.int16)
         return self._model.predict(audio_chunk)
+
+    def reset(self):
+        """
+        Clear the underlying openWakeWord model's internal rolling
+        context buffer.  Called by VoiceController when resuming
+        wake-word listening after a detection, so residual high scores
+        from the just-spoken wake phrase don't cause an instant
+        false re-trigger.
+        """
+        try:
+            self._model.reset()
+        except Exception as e:
+            log.debug("openWakeWord model.reset() failed (non-fatal): %s", e)

@@ -328,6 +328,13 @@ WHISPER_MODEL_SIZE: str = os.getenv("WHISPER_MODEL_SIZE", "base")
 WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE: str = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 
+# Language code for Whisper transcription. Default is "en" (English) to
+# avoid mis-detection on short utterances (Whisper's auto-detect often
+# guesses wrong languages like Hindi for Indian-accented English when
+# given only 2-4 seconds of audio). Set to "" (empty string) to restore
+# auto-detection if you regularly speak multiple languages.
+WHISPER_LANGUAGE: str = os.getenv("WHISPER_LANGUAGE", "en")
+
 # Whisper expects 16kHz mono audio — don't change this unless you know
 # you need to feed it something else.
 VOICE_SAMPLE_RATE: int = int(os.getenv("VOICE_SAMPLE_RATE", "16000"))
@@ -431,6 +438,13 @@ WAKE_WORD_MIC_GAIN: float = float(os.getenv("WAKE_WORD_MIC_GAIN", "10.0"))
 WAKE_WORD_SPEAKER_THRESHOLD: float = float(
     os.getenv("WAKE_WORD_SPEAKER_THRESHOLD", "0.01")
 )
+
+# Cooldown (in seconds) after wake word detection before the detector will
+# accept another trigger. Prevents the openWakeWord model's internal rolling
+# context buffer from causing an instant false re-trigger on residual audio
+# energy from the wake phrase that was just spoken. 2.0s is conservative;
+# lower it if you want faster back-to-back commands.
+WAKE_WORD_COOLDOWN_S: float = float(os.getenv("WAKE_WORD_COOLDOWN_S", "2.0"))
 
 # ---------------------------------------------------------------------------
 # Phase 10 — Native Desktop App

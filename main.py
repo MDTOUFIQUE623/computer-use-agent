@@ -1,12 +1,16 @@
 """
 main.py  —  Computer-Use Agent entry point
-Phase 3: shows active browser mode in the startup banner and runs a
-         lightweight CDP pre-flight check when BROWSER_MODE=attach.
-Phase 8: when VOICE_ENABLED=true, replaces the text input() loop below
-         with a global-hotkey + system-tray voice flow (src/voice.py).
-         _run_task() is the shared piece both paths funnel through — a
-         task string, however it was produced, runs through the exact
-         same graph.invoke() pipeline either way.
+Phase 3:  shows active browser mode in the startup banner and runs a
+          lightweight CDP pre-flight check when BROWSER_MODE=attach.
+Phase 8:  when VOICE_ENABLED=true, replaces the text input() loop below
+          with a global-hotkey + system-tray voice flow (src/voice.py).
+          _run_task() is the shared piece both paths funnel through — a
+          task string, however it was produced, runs through the exact
+          same graph.invoke() pipeline either way.
+Phase 10: when GUI_ENABLED=true, takes priority over both of the above
+          and opens the native desktop window instead (src/desktop_app.py)
+          — the window absorbs voice/wake-word listening in the
+          background too (no separate tray icon in this mode).
 """
 
 import sys
@@ -89,13 +93,14 @@ def _print_banner():
     from src.config import (
         BROWSER_MODE, CDP_URL, CDP_TAB_POLICY,
         VOICE_ENABLED, VOICE_HOTKEY, WAKE_WORD_ENABLED, WAKE_WORD_MODEL,
+        GUI_ENABLED,
     )
 
     mode = BROWSER_MODE.lower()
 
     print()
     print("╔══════════════════════════════════════════════════════╗")
-    print("║      Computer-Use Agent  —  Phase 9 (Wake Word)     ║")
+    print("║      Computer-Use Agent  —  Phase 10 (Desktop App)  ║")
     print("╚══════════════════════════════════════════════════════╝")
     print()
 
@@ -114,7 +119,13 @@ def _print_banner():
 
     print()
 
-    if VOICE_ENABLED:
+    if GUI_ENABLED:
+        print("  Input mode   : DESKTOP APP")
+        print()
+        print("  Opening the app window — type a task there, or use voice")
+        print("  if VOICE_ENABLED is set (works even while the window isn't focused).")
+        print("  This terminal window can be minimized once the app opens.")
+    elif VOICE_ENABLED:
         if WAKE_WORD_ENABLED:
             wake_phrase = WAKE_WORD_MODEL.replace("_", " ")
             print(f"  Input mode   : VOICE  (hotkey: {VOICE_HOTKEY}, wake word: \"{wake_phrase}\")")
@@ -133,7 +144,8 @@ def _print_banner():
         print()
         print("  Type 'quit' or 'exit' to stop.")
         print("  Type 'mode' to show the current browser mode.")
-        print("  Set VOICE_ENABLED=true in .env to switch to voice input.")
+        print("  Set VOICE_ENABLED=true in .env to switch to voice input, or")
+        print("  GUI_ENABLED=true for the desktop app.")
 
     print()
 
@@ -147,44 +159,16 @@ def _run_task(task: str) -> None:
     Run one task string through the full graph. Used by both the text
     REPL loop and (when VOICE_ENABLED=true) src.voice's on_task callback
     — a task is a task regardless of how the string was produced.
+
+    The actual invocation logic lives in src.graph.run_task_sync() —
+    shared with Phase 10's desktop app (src/desktop_app.py) so there's
+    exactly one canonical way to run a task, not two copies that can
+    drift apart over time.
     """
-    from src.graph import app as graph
+    from src.graph import run_task_sync
 
     print()
-
-    initial_state = {
-        "task":               task,
-        "plan":               None,
-        "current_step_index": 0,
-        "step_results":       [],
-        "retry_count":        0,
-        "is_done":            False,
-        "is_failed":          False,
-        "memory_hints":       None,
-        "last_error":         None,
-        "ask_user_message":   None,
-        "task_start_ms":      None,
-        "_last_tool_result":  None,
-        "_last_step_result":  None,
-        "slots":              None,
-        "_pending_subtasks":  None,
-        "_precomputed_plans": None,
-        "_precomputed_plan":  None,
-    }
-
-    try:
-        graph.invoke(initial_state)
-    except KeyboardInterrupt:
-        print("\n[Agent] Task interrupted.")
-        # Make sure we don't leave a dangling browser process in launch mode
-        from src.graph import _close_browser_instance
-        _close_browser_instance()
-    except Exception as e:
-        log.error("Unhandled graph error: %s", e, exc_info=True)
-        print(f"\n[ERROR] Unhandled error: {e}")
-        from src.graph import _close_browser_instance
-        _close_browser_instance()
-
+    run_task_sync(task)
     print()
 
 
@@ -237,6 +221,15 @@ def _run_voice_loop():
 
 
 # ---------------------------------------------------------------------------
+# Desktop app (Phase 10, opt-in via GUI_ENABLED)
+# ---------------------------------------------------------------------------
+
+def _run_desktop_app():
+    from src.desktop_app import run_desktop_app
+    run_desktop_app()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -247,9 +240,11 @@ def run():
     if not _cdp_preflight():
         sys.exit(1)
 
-    from src.config import VOICE_ENABLED
+    from src.config import GUI_ENABLED, VOICE_ENABLED
 
-    if VOICE_ENABLED:
+    if GUI_ENABLED:
+        _run_desktop_app()
+    elif VOICE_ENABLED:
         _run_voice_loop()
     else:
         _run_text_loop()

@@ -1044,17 +1044,32 @@ class BrowserTools:
  
             found_selector     = None
             candidate_locators = None
- 
-            for selector in selector_candidates:
-                try:
-                    locator = self._page.locator(selector)
-                    count   = locator.count()
-                    if count > 0:
-                        found_selector     = selector
-                        candidate_locators = locator
-                        break
-                except Exception:
-                    continue
+
+            # Wait up to 5 seconds for result elements to appear.
+            # YouTube (and similar SPAs) render search results
+            # asynchronously after the DOM is "loaded" — ytd-video-renderer
+            # elements typically appear 1-3 seconds later. Without this
+            # wait, we'd immediately return NoResultsFound.
+            wait_deadline = time.monotonic() + 5.0
+            while True:
+                for selector in selector_candidates:
+                    try:
+                        locator = self._page.locator(selector)
+                        count   = locator.count()
+                        if count > 0:
+                            found_selector     = selector
+                            candidate_locators = locator
+                            break
+                    except Exception:
+                        continue
+
+                if found_selector is not None:
+                    break
+
+                if time.monotonic() >= wait_deadline:
+                    break
+
+                time.sleep(0.3)
  
             if found_selector is None:
                 return ToolResult(

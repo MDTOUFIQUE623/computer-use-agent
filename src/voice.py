@@ -53,6 +53,7 @@ from src.config import (
     WHISPER_MODEL_SIZE,
     WHISPER_DEVICE,
     WHISPER_COMPUTE_TYPE,
+    WHISPER_LANGUAGE,
     VOICE_SAMPLE_RATE,
     VOICE_MAX_RECORDING_SECONDS,
     WAKE_WORD_ENABLED,
@@ -65,6 +66,7 @@ from src.config import (
     WAKE_WORD_MIC_GAIN,
     VOICE_DEVICE_INDEX,
     WAKE_WORD_SPEAKER_THRESHOLD,
+    WAKE_WORD_COOLDOWN_S,
 )
 
 log = logging.getLogger(__name__)
@@ -243,6 +245,11 @@ class VoiceController:
         self._model = None
         self._cached_meter = None
         self._last_suppression_log_time = 0.0
+        # Cooldown: timestamp (monotonic) before which wake word
+        # detections are ignored — prevents instant false re-triggers
+        # from the model's internal rolling buffer retaining residual
+        # scores from the wake phrase that was just spoken.
+        self._wakeword_resume_time: float = 0.0
 
     # -- Whisper -------------------------------------------------------
 
@@ -270,9 +277,7 @@ class VoiceController:
         # trims that out before transcription runs on it.
         segments, _info = model.transcribe(
             audio,
-            language=None,  # auto-detect; hardcode "en" here if you want
-                             # to shave a little latency and always speak
-                             # the same language
+            language=WHISPER_LANGUAGE or None,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500),
         )
@@ -282,7 +287,10 @@ class VoiceController:
 
     def _audio_callback(self, indata, frames, time_info, status):
         if status:
-            log.warning("Audio input status: %s", status)
+            now = time.monotonic()
+            if now - getattr(self, '_last_rec_overflow_log', 0) >= 5.0:
+                log.warning("Audio input status: %s", status)
+                self._last_rec_overflow_log = now
 
         with self._record_lock:
             if not self._recording:
@@ -540,27 +548,41 @@ class VoiceController:
 
     def _wakeword_audio_callback(self, indata, frames, time_info, status):
         if status:
-            log.warning("Wake word audio input status: %s", status)
+            now = time.monotonic()
+            if now - getattr(self, '_last_ww_overflow_log', 0) >= 5.0:
+                log.warning("Wake word audio input status: %s", status)
+                self._last_ww_overflow_log = now
 
         with self._record_lock:
             if self._recording or self._task_running:
                 return  # busy — ignore, don't trigger a second overlapping task
 
-        # Check system audio playback to prevent self-triggering loop
+        # Cooldown: ignore detections for a short window after resuming
+        # wake word listening — the model's internal rolling context
+        # buffer retains residual high scores from the wake phrase just
+        # spoken, causing instant false re-triggers without this.
+        if time.monotonic() < self._wakeword_resume_time:
+            return
+
+        # Check system audio playback — instead of fully suppressing
+        # wake word detection (which permanently blocks it during music
+        # playback), we raise the required score so the user can still
+        # trigger by speaking clearly over the audio.
+        speaker_active = False
         if WAKE_WORD_SPEAKER_THRESHOLD > 0.0:
             try:
                 meter = self._get_speaker_meter()
                 if meter is not None:
                     peak = meter.GetPeakValue()
                     if peak >= WAKE_WORD_SPEAKER_THRESHOLD:
+                        speaker_active = True
                         now = time.monotonic()
-                        if now - self._last_suppression_log_time >= 5.0:
+                        if now - self._last_suppression_log_time >= 10.0:
                             log.info(
-                                "System audio playback detected (peak=%.3f) — suppressing wake word detection to avoid self-triggering loop",
+                                "System audio playing (peak=%.3f) — wake word threshold boosted to reduce false triggers",
                                 peak
                             )
                             self._last_suppression_log_time = now
-                        return
             except Exception as e:
                 log.debug("COM error reading speaker meter: %s", e)
                 self._cached_meter = None
@@ -580,8 +602,15 @@ class VoiceController:
             log.error("Wake word prediction failed: %s", e)
             return
 
+        # When system audio is playing, require a much stronger detection
+        # to avoid self-triggering from the system's own output, while
+        # still allowing deliberate wake word attempts from the user.
+        effective_threshold = WAKE_WORD_THRESHOLD
+        if speaker_active:
+            effective_threshold = min(WAKE_WORD_THRESHOLD * 1.7, 0.90)
+
         for name, score in scores.items():
-            if score >= WAKE_WORD_THRESHOLD:
+            if score >= effective_threshold:
                 log.info("Wake word '%s' detected (score=%.2f)", name, score)
                 # Stop wake-word listening immediately: only one audio
                 # stream at a time, and this also prevents re-triggering
@@ -608,6 +637,21 @@ class VoiceController:
 
         import sounddevice as sd
         from src.wakeword import WAKE_WORD_CHUNK_SAMPLES
+
+        # Reset the wake word detector's internal rolling buffer so
+        # residual scores from the previous detection don't immediately
+        # cause a false re-trigger.
+        try:
+            detector = self._get_wakeword_detector()
+            if hasattr(detector, 'reset'):
+                detector.reset()
+        except Exception as e:
+            log.debug("Could not reset wake word detector: %s", e)
+
+        # Set cooldown: ignore all detections for WAKE_WORD_COOLDOWN_S
+        # seconds from now, giving the mic time to "clear" any residual
+        # audio from the previous wake word utterance.
+        self._wakeword_resume_time = time.monotonic() + WAKE_WORD_COOLDOWN_S
 
         try:
             self._get_wakeword_detector()  # load eagerly here, not on
