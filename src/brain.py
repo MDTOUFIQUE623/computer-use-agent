@@ -916,14 +916,11 @@ class Brain:
             raw = self._client.generate_content(
                 system_instruction=None,
                 prompt=prompt,
-                # 800, not 500: this produces one full Step object with
-                # the same free-text fields (description,
-                # expected_outcome) as the main planner, which budgets
-                # 2000 tokens for potentially many such objects. 500 was
-                # tight enough that a moderately verbose response could
-                # get cut mid-string, producing a JSON parse failure
-                # (observed 2026-07-02: "Unterminated string...").
-                max_output_tokens=800,
+                # 1500: generous enough for a full Step JSON with
+                # free-text description/expected_outcome fields.
+                # Previous values (500, then 800) caused truncated
+                # JSON responses on verbose model outputs.
+                max_output_tokens=1500,
                 json_mode=True,
             ).strip()
 
@@ -971,7 +968,34 @@ class Brain:
             return Step(**data)
 
         except json.JSONDecodeError as e:
-            log.error("Invalid replan response: %s", e)
+            log.warning("Replan JSON parse failed: %s — attempting repair", e)
+            repaired = _repair_truncated_json(raw)
+            if repaired:
+                try:
+                    data = json.loads(repaired)
+                    log.info("Repaired truncated replan JSON successfully")
+                    if data.get("impossible"):
+                        return None
+                    if not data.get("target"):
+                        action = data.get("action")
+                        if action in self._TARGETLESS_ACTIONS:
+                            data["target"] = self._placeholder_target_for(action)
+                        else:
+                            log.warning("Repaired replan still has no target")
+                            return None
+                    if data.get("value") is not None:
+                        data["value"] = str(data["value"])
+                    data["tool"]   = ToolType(data["tool"])
+                    data["action"] = ActionType(data["action"])
+                    if data.get("fallback_tool"):
+                        data["fallback_tool"] = ToolType(data["fallback_tool"])
+                    else:
+                        data["fallback_tool"] = None
+                    return Step(**data)
+                except Exception as inner_e:
+                    log.error("Repaired JSON still failed: %s", inner_e)
+            else:
+                log.error("Invalid replan response (unrepairable): %s", e)
             return None
         except Exception as e:
             log.error("replan_step failed: %s", e)
@@ -1327,3 +1351,48 @@ def _strip_markdown(text: str) -> str:
         return text[start:end + 1].strip()
 
     return text.strip()
+
+
+def _repair_truncated_json(raw: str) -> Optional[str]:
+    """
+    Attempt to repair a truncated JSON object — e.g. an LLM response
+    that was cut mid-string because of max_output_tokens.
+
+    Strategy:
+      1. Close any unterminated string literal.
+      2. Balance curly braces by appending closing braces.
+    Returns None if the input doesn't look repairable.
+    """
+    if not raw or "{" not in raw:
+        return None
+
+    text = raw.rstrip()
+
+    # If we're inside an unterminated string, close it
+    # Count un-escaped quotes after the last opening brace
+    in_string = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '\\' and in_string:
+            i += 2  # skip escaped character
+            continue
+        if ch == '"':
+            in_string = not in_string
+        i += 1
+
+    if in_string:
+        text += '"'
+
+    # Balance braces
+    open_count = text.count("{")
+    close_count = text.count("}")
+    if open_count > close_count:
+        text += "}" * (open_count - close_count)
+
+    # Quick sanity check: can json.loads parse it?
+    try:
+        json.loads(text)
+        return text
+    except json.JSONDecodeError:
+        return None
